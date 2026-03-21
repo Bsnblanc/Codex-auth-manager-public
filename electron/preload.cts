@@ -5,7 +5,7 @@ contextBridge.exposeInMainWorld("opencodeCodexAuth", {
   getState: () => ipcRenderer.invoke("dashboard:get-state"),
   refreshAll: () => ipcRenderer.invoke("dashboard:refresh-all"),
   refreshAccount: (accountId: string) => ipcRenderer.invoke("dashboard:refresh-account", accountId),
-  updateSettings: (patch: { opencodeAuthPath?: string; pollIntervalMs?: number }) => ipcRenderer.invoke("settings:update", patch),
+  updateSettings: (patch: { currentMode?: "opencode" | "codex"; opencodeAuthPath?: string; codexAuthPath?: string; pollIntervalMs?: number }) => ipcRenderer.invoke("settings:update", patch),
   pickAuthPath: () => ipcRenderer.invoke("settings:pick-auth-path"),
   loginImportAccount: () => ipcRenderer.invoke("accounts:login-import"),
   importLiveAccount: () => ipcRenderer.invoke("accounts:import-live"),

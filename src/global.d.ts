@@ -7,7 +7,7 @@ declare global {
       getState: () => Promise<unknown>;
       refreshAll: () => Promise<unknown>;
       refreshAccount: (accountId: string) => Promise<unknown>;
-      updateSettings: (patch: { opencodeAuthPath?: string; pollIntervalMs?: number }) => Promise<unknown>;
+      updateSettings: (patch: { currentMode?: "opencode" | "codex"; opencodeAuthPath?: string; codexAuthPath?: string; pollIntervalMs?: number }) => Promise<unknown>;
       pickAuthPath: () => Promise<unknown>;
       loginImportAccount: () => Promise<unknown>;
       importLiveAccount: () => Promise<unknown>;

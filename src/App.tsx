@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, 
 type QuotaWindowKey = "fiveHour" | "weekly" | "codeReview";
 type Locale = "en-US" | "zh-CN";
 type ThemeMode = "light" | "dark";
+type AuthMode = "opencode" | "codex";
 
 type QuotaWindowSnapshot = {
   usedPercent: number | null;
@@ -49,10 +50,13 @@ type HistoryEntry = {
 type DashboardState = {
   revision: number;
   settings: {
+    currentMode: AuthMode;
     opencodeAuthPath: string;
+    codexAuthPath: string;
     pollIntervalMs: number;
   };
-  activeAccountId: string | null;
+  activeOpenCodeAccountId: string | null;
+  activeCodexAccountId: string | null;
   accounts: ManagedAccount[];
   history: HistoryEntry[];
 };
@@ -84,8 +88,11 @@ function isDashboardState(value: unknown): value is DashboardState {
   return typeof candidate.revision === "number"
     && Array.isArray(candidate.accounts)
     && Array.isArray(candidate.history)
-    && typeof candidate.activeAccountId !== "undefined"
+    && typeof candidate.activeOpenCodeAccountId !== "undefined"
+    && typeof candidate.activeCodexAccountId !== "undefined"
+    && (candidate.settings?.currentMode === "opencode" || candidate.settings?.currentMode === "codex")
     && typeof candidate.settings?.opencodeAuthPath === "string"
+    && typeof candidate.settings?.codexAuthPath === "string"
     && typeof candidate.settings?.pollIntervalMs === "number";
 }
 
@@ -96,8 +103,10 @@ function normalizeErrorMessage(error: unknown) {
       return "未找到所选账号，请重新选择后重试。";
     case "No managed accounts were selected for export.":
       return "没有可导出的账号。";
+    case "No Codex auth entry was found in the live Codex auth file.":
     case "No Codex/OpenAI OAuth entry was found in the configured auth file.":
       return "当前 Auth 文件中没有找到 Codex/OpenAI OAuth 账号。";
+    case "No Codex auth entry was found in the live Codex auth file after login.":
     case "No Codex/OpenAI OAuth entry was found in the configured auth file after login.":
       return "登录完成后未在 Auth 文件中找到 Codex/OpenAI OAuth 账号。";
     default:
@@ -109,10 +118,13 @@ function emptyDashboardState(): DashboardState {
   return {
     revision: 0,
     settings: {
+      currentMode: "opencode",
       opencodeAuthPath: "",
+      codexAuthPath: "",
       pollIntervalMs: 600000
     },
-    activeAccountId: null,
+    activeOpenCodeAccountId: null,
+    activeCodexAccountId: null,
     accounts: [],
     history: []
   };
@@ -1169,12 +1181,15 @@ export default function App() {
   const accountRefreshTimeoutsRef = useRef<Record<string, number>>({});
   const accountRefreshInFlightRef = useRef<Record<string, boolean>>({});
   const [chipRailHeight, setChipRailHeight] = useState(0);
+  const currentMode = state.settings.currentMode;
+  const currentModeAuthPath = currentMode === "codex" ? state.settings.codexAuthPath : state.settings.opencodeAuthPath;
+  const currentModeActiveAccountId = currentMode === "codex" ? state.activeCodexAccountId : state.activeOpenCodeAccountId;
 
   useEffect(() => {
     if (state) {
-      setPathDraft(state.settings.opencodeAuthPath);
+      setPathDraft(currentModeAuthPath);
     }
-  }, [state?.settings.opencodeAuthPath]);
+  }, [currentModeAuthPath, state]);
 
   useEffect(() => {
     const rail = chipRailRef.current;
@@ -1237,24 +1252,6 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!getAuthOpen || runningAuthAction) {
-      return;
-    }
-
-    function onPointerMove(event: MouseEvent) {
-      const target = event.target as Node;
-      if (getAuthRef.current?.contains(target)) {
-        openGetAuthMenu();
-      } else {
-        closeGetAuthMenuSoon();
-      }
-    }
-
-    document.addEventListener("mousemove", onPointerMove);
-    return () => document.removeEventListener("mousemove", onPointerMove);
-  }, [getAuthOpen, runningAuthAction]);
-
-  useEffect(() => {
     return () => {
       if (getAuthCloseTimerRef.current !== null) {
         window.clearTimeout(getAuthCloseTimerRef.current);
@@ -1279,7 +1276,14 @@ export default function App() {
   const activeMarkerAccountId = focus.kind === "account" ? focus.accountId : hoveredAccountId;
 
   useEffect(() => {
-    if (!window.opencodeCodexAuth || !state.settings.opencodeAuthPath) {
+    if (focus.kind === "account" && !state.accounts.some((account) => account.id === focus.accountId)) {
+      setFocus({ kind: "overview" });
+      setHoveredAccountId(null);
+    }
+  }, [focus, state.accounts]);
+
+  useEffect(() => {
+    if (!window.opencodeCodexAuth || !currentModeAuthPath) {
       return;
     }
 
@@ -1287,7 +1291,7 @@ export default function App() {
     accountRefreshTimeoutsRef.current = {};
 
     for (const account of state.accounts) {
-      const nextRefreshAt = getAccountNextRefreshAt(account, state.activeAccountId === account.id, Date.now());
+      const nextRefreshAt = getAccountNextRefreshAt(account, currentModeActiveAccountId === account.id, Date.now());
       if (nextRefreshAt === null) {
         continue;
       }
@@ -1313,7 +1317,7 @@ export default function App() {
       Object.values(accountRefreshTimeoutsRef.current).forEach((handle) => window.clearTimeout(handle));
       accountRefreshTimeoutsRef.current = {};
     };
-  }, [applyState, run, state.accounts, state.activeAccountId, state.settings.opencodeAuthPath]);
+  }, [applyState, currentModeActiveAccountId, currentModeAuthPath, run, state.accounts]);
 
   const chartSeries = useMemo(() => {
     if (!state || focus.kind === "overview") {
@@ -1406,6 +1410,19 @@ export default function App() {
     closeGetAuthMenuSoon();
   }
 
+  function handleGetAuthPointerLeave(event: React.MouseEvent<HTMLDivElement> | React.PointerEvent<HTMLDivElement>) {
+    if (runningAuthAction) {
+      return;
+    }
+
+    const nextTarget = event.relatedTarget as Node | null;
+    if (nextTarget && getAuthRef.current?.contains(nextTarget)) {
+      return;
+    }
+
+    closeGetAuthMenuSoon();
+  }
+
   function openSettingsMenu() {
     if (settingsCloseTimerRef.current !== null) {
       window.clearTimeout(settingsCloseTimerRef.current);
@@ -1468,6 +1485,22 @@ export default function App() {
     setMessage(successMessage);
   }
 
+  function handleModeSwitch(nextMode: AuthMode) {
+    if (nextMode === currentMode) {
+      return;
+    }
+
+    void run(
+      () => window.opencodeCodexAuth.updateSettings({ currentMode: nextMode }),
+      (result) => {
+        if (isDashboardState(result)) {
+          applyState(result);
+        }
+      },
+      { clearMessage: false }
+    );
+  }
+
   async function handleFileImportSelection(event: ChangeEvent<HTMLInputElement>) {
     const files = Array.from(event.target.files ?? []);
     event.target.value = "";
@@ -1504,14 +1537,19 @@ export default function App() {
         onChange={(event) => { void handleFileImportSelection(event); }}
       />
       <header className="main-header">
-        <h1 className="app-title">{text.appName}</h1>
+        <h1 className="app-title app-title-mode" data-preserve-focus="true">
+          <button className={`app-title-mode-button${currentMode === "opencode" ? " is-active" : ""}`} onClick={() => handleModeSwitch("opencode")}>OpenCode</button>
+          <span className="app-title-mode-separator">/</span>
+          <button className={`app-title-mode-button${currentMode === "codex" ? " is-active" : ""}`} onClick={() => handleModeSwitch("codex")}>Codex</button>
+          <span className="app-title-mode-suffix">Auth</span>
+        </h1>
         <div className="header-actions">
           <div 
             ref={getAuthRef}
             className="dropdown-container"
             onMouseEnter={openGetAuthMenu}
-            onMouseLeave={closeGetAuthMenuSoon}
-            onPointerLeave={closeGetAuthMenuSoon}
+            onMouseLeave={handleGetAuthPointerLeave}
+            onPointerLeave={handleGetAuthPointerLeave}
             onBlur={handleGetAuthBlur}
           >
             <button className={`expandable-button auth-toolbar-button${getAuthOpen ? " is-open" : ""}${authClosing ? " is-closing" : ""}${runningAuthAction ? ` is-running-auth is-auth-${runningAuthAction}` : ""}`} title={text.getAuth} aria-label={text.getAuth} onClick={() => { setAuthClosing(false); setGetAuthOpen((open) => !open); }}>
@@ -1522,7 +1560,7 @@ export default function App() {
               <span className="toolbar-utility"><IconChevronDown /></span>
             </button>
             {getAuthOpen && (
-              <div className="dropdown-menu" onMouseEnter={openGetAuthMenu} onMouseLeave={closeGetAuthMenuSoon} onPointerLeave={closeGetAuthMenuSoon}>
+              <div className="dropdown-menu" onMouseEnter={openGetAuthMenu} onMouseLeave={handleGetAuthPointerLeave} onPointerLeave={handleGetAuthPointerLeave}>
                   <button onMouseEnter={() => applyAuthPreviewAction("login")} onFocus={() => applyAuthPreviewAction("login")} onClick={() => { void runAuthAction("login", () => window.opencodeCodexAuth.loginImportAccount(), (r) => handleImportResult(r as ImportResult | null)); }}>
                     {text.loginImport}
                 </button>
@@ -1570,7 +1608,7 @@ export default function App() {
                   <div className="auth-path-inputs">
                     <input className="compact-input" value={pathDraft} onChange={(e) => setPathDraft(e.target.value)} />
                     <button className="ghost-button compact-button" onClick={() => run(() => window.opencodeCodexAuth.pickAuthPath(), (n) => n && handleStateResult(n, locale === "zh-CN" ? "已更新 Auth 路径" : "Auth path updated"))}>{text.browse}</button>
-                    <button className="ghost-button compact-button" onClick={() => run(() => window.opencodeCodexAuth.updateSettings({ opencodeAuthPath: pathDraft }), (r) => handleStateResult(r, locale === "zh-CN" ? "已保存 Auth 路径" : "Auth path saved"))}>{text.save}</button>
+                    <button className="ghost-button compact-button" onClick={() => run(() => window.opencodeCodexAuth.updateSettings(currentMode === "codex" ? { codexAuthPath: pathDraft } : { opencodeAuthPath: pathDraft }), (r) => handleStateResult(r, locale === "zh-CN" ? "已保存 Auth 路径" : "Auth path saved"))}>{text.save}</button>
                   </div>
                 </div>
               </div>
@@ -1579,7 +1617,7 @@ export default function App() {
         </div>
       </header>
 
-      <main className={`main-stage${accountsCollapsed ? " is-accounts-collapsed" : ""}${focus.kind !== "overview" ? " is-focus-open" : ""}`}>
+      <main className={`main-stage${accountsCollapsed ? " is-accounts-collapsed" : ""}${focus.kind !== "overview" ? " is-focus-open" : ""}${accountsCollapsed && focus.kind === "overview" ? " is-overview-centered" : ""}`}>
         <section className="unified-quota-card surface-card">
           {aggregateBars.map((bar) => (
             <div className="quota-row" key={bar.quotaKey}>
@@ -1608,7 +1646,7 @@ export default function App() {
                     {visibleSegments.map((seg) => {
                       const dimmed = activeVisualAccountId && activeVisualAccountId !== seg.accountId;
                       const focused = focus.kind === "account" && focus.accountId === seg.accountId;
-                      const active = state.activeAccountId === seg.accountId;
+                      const active = currentModeActiveAccountId === seg.accountId;
                       const segmentIndex = renderedSegments.findIndex((segment) => segment.accountId === seg.accountId);
                       const isFirstVisible = segmentIndex === 0;
                       const isLastVisible = segmentIndex === renderedSegments.length - 1;
@@ -1705,7 +1743,7 @@ export default function App() {
         <div className={`chip-rail-shell${accountsCollapsed ? " is-collapsed" : ""}`} style={{ maxHeight: accountsCollapsed ? "0px" : `${chipRailHeight}px` } as CSSProperties}>
           <section ref={chipRailRef} className="chip-rail">
           {state.accounts.map((account) => {
-            const active = state.activeAccountId === account.id;
+            const active = currentModeActiveAccountId === account.id;
             const highlighted = hoveredAccountId === account.id || (focus.kind === "account" && focus.accountId === account.id);
             const creditsLabel = getCreditsLabel(account, locale, text.creditsLabel);
             return (

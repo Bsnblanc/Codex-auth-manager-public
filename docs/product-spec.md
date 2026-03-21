@@ -2,7 +2,7 @@
 
 ## Product Goal
 
-Build a Windows desktop app that manages Codex auth for OpenCode and compatible direct file-backed Codex auth targets.
+Build a Windows desktop app that manages OpenCode auth and direct file-backed Codex auth through one unified interface, while transforming between the two formats only when needed.
 
 The app must let the user:
 
@@ -17,6 +17,7 @@ The app must let the user:
 
 - Windows desktop app
 - single-page interaction model
+- support OpenCode-mode and Codex-mode auth workflows
 - manage Codex/OpenAI auth used by OpenCode and compatible direct Codex auth files
 - preserve other provider auth inside the live OpenCode auth file
 - active-account dynamic quota polling plus reset-based background refresh
@@ -35,8 +36,11 @@ The app must let the user:
 1. The app keeps its own managed account store rather than relying on one live auth file snapshot.
 2. When the target file is an OpenCode auth file, unrelated provider entries must remain unchanged.
 3. When the target file is a direct Codex auth file, writeback is allowed only if the managed account preserves the direct-specific fields required by that file format.
-4. The UI is single-page. Hover and focus states determine what details are visible.
-5. Usage statistics only expand when the user focuses an account or the aggregate view.
+4. The current mode determines which login/import/export/switch actions are available and which target auth path is shown.
+5. The app exposes only two user-facing auth formats: OpenCode auth and Codex auth.
+6. The app may keep a richer internal auth superset, but that internal shape is not a user-facing import/export format.
+7. The UI is single-page. Hover and focus states determine what details are visible.
+8. Usage statistics only expand when the user focuses an account or the aggregate view.
 
 ## Desktop Architecture
 
@@ -111,6 +115,29 @@ The configured auth path may point to:
 1. an OpenCode auth file with multiple provider nodes, or
 2. a direct file-backed Codex auth file.
 
+The visible auth path belongs to the current mode only.
+
+### Mode Rule
+
+The app has two modes:
+
+1. `OpenCode` mode
+2. `Codex` mode
+
+The current mode controls:
+
+- which login command is used
+- which JSON import format is accepted
+- which auth path is edited and written
+- which accounts are visible and switchable
+- which export format is produced
+
+### Acquisition Rule
+
+- `OpenCode` mode accepts OpenCode login/import flows
+- `Codex` mode accepts Codex login/import flows
+- if an imported OpenCode account lacks direct Codex fields, it remains usable only in OpenCode mode
+
 ### OpenCode Sync Rule
 
 When the user switches accounts, the app:
@@ -124,9 +151,9 @@ When the user switches accounts, the app:
 ### Import and Export
 
 - import only Codex/OpenAI auth fragments into the managed store
-- export only the managed Codex/OpenAI fragment and metadata
+- export only the current mode's real auth format
 - do not import or export unrelated provider credentials
-- direct Codex auth files may be imported into the same managed account store when they contain a reusable Codex OAuth token set
+- do not expose any separate richer manager format to the user
 
 ## Quota and Statistics Model
 
@@ -210,17 +237,19 @@ Each bar uses:
 ## Core Features for MVP
 
 1. local managed account store
-2. live OpenCode Codex auth merge-patch switching
-3. compatible direct Codex file-backed auth import and safe writeback
-4. active dynamic + background reset-based quota refresh
-5. single-page dashboard with hover/focus interactions
-6. aggregate and per-account charts
-7. add/import/export/delete actions
-8. local persistence of quota history
+2. mode-specific login/import/export/switch behavior
+3. on-demand OpenCode Codex auth merge-patch switching
+4. compatible direct Codex file-backed auth import and safe writeback
+5. active dynamic + background reset-based quota refresh
+6. single-page dashboard with hover/focus interactions
+7. aggregate and per-account charts
+8. add/import/export/delete actions
+9. local persistence of quota history
 
 ## Validation Criteria
 
 - user can add at least two managed Codex accounts
+- current mode determines login/import/export/switch behavior
 - user can switch OpenCode's active Codex auth without overwriting unrelated providers
 - direct file-backed Codex auth can be imported when it contains the required direct fields
 - all managed accounts display quota state in one screen

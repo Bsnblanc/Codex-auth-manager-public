@@ -3,7 +3,7 @@ import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { getAccountIdFromJwt, getEmailFromJwt, getJwtMetadata } from "./jwt.js";
 import { nextAccountColor } from "./store.js";
-import type { AuthFileRecord, AuthProviderEntry, ManagedAccount, ProviderKey } from "./types.js";
+import type { AuthFileRecord, AuthMode, AuthProviderEntry, ManagedAccount, ProviderKey } from "./types.js";
 
 const PREFERRED_KEYS: ProviderKey[] = ["opencode", "codex", "openai", "chatgpt"];
 
@@ -41,6 +41,12 @@ function isCodexDirectAuthFile(value: unknown): value is CodexDirectAuthFile {
 function toOpenCodeAuthFragment(fragment: AuthProviderEntry): AuthProviderEntry {
   const { id_token: _idToken, auth_mode: _authMode, last_refresh: _lastRefresh, ...rest } = fragment;
   return rest;
+}
+
+function buildOpenCodeAuthFile(fragment: AuthProviderEntry): AuthFileRecord {
+  return {
+    openai: toOpenCodeAuthFragment(fragment)
+  };
 }
 
 function buildDirectCodexAuthFile(fragment: AuthProviderEntry): CodexDirectAuthFile {
@@ -114,15 +120,6 @@ export function pickCodexAuthEntry(source: unknown): { providerKey: ProviderKey;
 
   if (!isObject(source)) return null;
 
-  const managerFragment = source["authFragment"];
-  const managerKey = source["providerKey"];
-  if (typeof managerKey === "string" && isOauthEntry(managerFragment)) {
-    return {
-      providerKey: managerKey,
-      authFragment: managerFragment
-    };
-  }
-
   for (const preferredKey of PREFERRED_KEYS) {
     const candidate = source[preferredKey];
     if (isOauthEntry(candidate)) {
@@ -143,6 +140,45 @@ export function pickCodexAuthEntry(source: unknown): { providerKey: ProviderKey;
   }
 
   return null;
+}
+
+export function pickAuthEntryForMode(mode: AuthMode, source: unknown): { providerKey: ProviderKey; authFragment: AuthProviderEntry } | null {
+  if (mode === "codex") {
+    return isCodexDirectAuthFile(source) ? pickCodexAuthEntry(source) : null;
+  }
+
+  if (isOauthEntry(source)) {
+    return {
+      providerKey: "openai",
+      authFragment: source
+    };
+  }
+
+  if (!isObject(source)) {
+    return null;
+  }
+
+  for (const preferredKey of PREFERRED_KEYS) {
+    const candidate = source[preferredKey];
+    if (isOauthEntry(candidate)) {
+      return {
+        providerKey: preferredKey,
+        authFragment: candidate
+      };
+    }
+  }
+
+  return null;
+}
+
+export function canUseAccountInMode(account: ManagedAccount, mode: AuthMode) {
+  if (mode === "opencode") {
+    return typeof account.authFragment.access === "string" && typeof account.authFragment.refresh === "string";
+  }
+
+  return typeof account.authFragment.access === "string"
+    && typeof account.authFragment.refresh === "string"
+    && typeof account.authFragment.id_token === "string";
 }
 
 function inferAccountLabel(fragment: AuthProviderEntry, fallback: string) {
@@ -252,15 +288,10 @@ export async function mergeAccountIntoOpenCodeAuth(filePath: string, account: Ma
   await writeJsonAtomic(filePath, authFile);
 }
 
-export async function buildExportPayload(account: ManagedAccount) {
-  return {
-    version: 1,
-    exportedAt: new Date().toISOString(),
-    providerKey: account.providerKey,
-    label: account.label,
-    color: account.color,
-    authFragment: account.authFragment
-  };
+export async function buildExportPayload(account: ManagedAccount, mode: AuthMode) {
+  return mode === "codex"
+    ? buildDirectCodexAuthFile(account.authFragment)
+    : buildOpenCodeAuthFile(account.authFragment);
 }
 
 export type JsonFileSnapshot = {

@@ -1,5 +1,7 @@
 export type ProviderKey = "opencode" | "codex" | "openai" | "chatgpt" | string;
 
+export type AuthMode = "opencode" | "codex";
+
 export type AuthProviderEntry = {
   type?: string;
   access?: string;
@@ -85,14 +87,17 @@ export type ManagedAccount = {
 };
 
 export type AppSettings = {
+  currentMode: AuthMode;
   opencodeAuthPath: string;
+  codexAuthPath: string;
   pollIntervalMs: number;
 };
 
 export type AppStore = {
   revision: number;
   settings: AppSettings;
-  activeAccountId: string | null;
+  activeOpenCodeAccountId: string | null;
+  activeCodexAccountId: string | null;
   accounts: ManagedAccount[];
   history: HistoryEntry[];
 };
@@ -100,7 +105,8 @@ export type AppStore = {
 export type DashboardState = {
   revision: number;
   settings: AppSettings;
-  activeAccountId: string | null;
+  activeOpenCodeAccountId: string | null;
+  activeCodexAccountId: string | null;
   accounts: ManagedAccount[];
   history: HistoryEntry[];
 };

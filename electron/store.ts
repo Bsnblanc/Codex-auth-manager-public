@@ -21,9 +21,25 @@ function defaultOpenCodeAuthPath() {
   return path.join(os.homedir(), ".local", "share", "opencode", "auth.json");
 }
 
+function defaultCodexAuthPath() {
+  return path.join(os.homedir(), ".codex", "auth.json");
+}
+
+function canUseAccountInMode(account: ManagedAccount, mode: AppSettings["currentMode"]) {
+  if (mode === "opencode") {
+    return typeof account.authFragment.access === "string" && typeof account.authFragment.refresh === "string";
+  }
+
+  return typeof account.authFragment.access === "string"
+    && typeof account.authFragment.refresh === "string"
+    && typeof account.authFragment.id_token === "string";
+}
+
 function defaultSettings(): AppSettings {
   return {
+    currentMode: "opencode",
     opencodeAuthPath: defaultOpenCodeAuthPath(),
+    codexAuthPath: defaultCodexAuthPath(),
     pollIntervalMs: 600000
   };
 }
@@ -32,7 +48,8 @@ function defaultStore(): AppStore {
   return {
     revision: 0,
     settings: defaultSettings(),
-    activeAccountId: null,
+    activeOpenCodeAccountId: null,
+    activeCodexAccountId: null,
     accounts: [],
     history: []
   };
@@ -58,6 +75,11 @@ export async function loadStore(): Promise<AppStore> {
         ...defaultSettings(),
         ...(parsed.settings ?? {})
       },
+      activeOpenCodeAccountId:
+        typeof (parsed as Partial<AppStore> & { activeAccountId?: unknown }).activeAccountId === "string"
+          ? (parsed as Partial<AppStore> & { activeAccountId?: string | null }).activeAccountId ?? null
+          : parsed.activeOpenCodeAccountId ?? null,
+      activeCodexAccountId: parsed.activeCodexAccountId ?? null,
       accounts: (parsed.accounts ?? []).map((account) => ({
         ...account,
         labelIsAuto: account.labelIsAuto ?? true
@@ -78,11 +100,13 @@ export async function saveStore(store: AppStore): Promise<void> {
 }
 
 export function toDashboardState(store: AppStore): DashboardState {
+  const visibleAccounts = store.accounts.filter((account) => canUseAccountInMode(account, store.settings.currentMode));
   return {
     revision: store.revision,
     settings: store.settings,
-    activeAccountId: store.activeAccountId,
-    accounts: store.accounts,
+    activeOpenCodeAccountId: store.activeOpenCodeAccountId,
+    activeCodexAccountId: store.activeCodexAccountId,
+    accounts: visibleAccounts,
     history: store.history
   };
 }

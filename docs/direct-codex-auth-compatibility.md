@@ -101,4 +101,13 @@ This means the app can safely support:
 - detecting whether a managed account has enough direct-specific fields for direct Codex writeback
 - refusing direct Codex activation/writeback when the required direct fields are missing
 
+## Public Format Decision
+
+The app should expose only two user-facing auth formats:
+
+1. OpenCode auth
+2. direct Codex auth
+
+The app may keep a richer internal auth superset to transform between them when possible, but that richer shape should not be exposed as a third public import/export format.
+
 This avoids pretending the two formats are interchangeable when the current local evidence shows they are not.

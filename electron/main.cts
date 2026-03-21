@@ -1,13 +1,16 @@
-import type { DashboardState, ExportResult, HistoryEntry, ImportResult, ManagedAccount } from "./types.js";
+import type { AppStore, AuthMode, DashboardState, ExportResult, HistoryEntry, ImportResult, ManagedAccount } from "./types.js";
 
 const { app, BrowserWindow, dialog, ipcMain } = require("electron");
 const { spawn } = require("node:child_process");
+const os = require("node:os");
 const path = require("node:path");
 const {
   buildExportPayload,
+  canUseAccountInMode,
   captureJsonFileSnapshot,
   mergeAccountIntoOpenCodeAuth,
   normalizeAutoLabels,
+  pickAuthEntryForMode,
   pickCodexAuthEntry,
   readJsonFile,
   readOpenCodeAuthFile,
@@ -33,6 +36,33 @@ function runStoreMutation<T>(mutation: () => Promise<T>): Promise<T> {
 function sanitizeExportFileName(value: string) {
   const normalized = value.replace(/[<>:"/\\|?*\x00-\x1F]/g, " ").replace(/\s+/g, " ").trim();
   return normalized || "account";
+}
+
+function getCodexLiveAuthPath() {
+  return path.join(os.homedir(), ".codex", "auth.json");
+}
+
+function getLiveImportPath(store: AppStore, mode: AuthMode = store.settings.currentMode) {
+  return mode === "codex" ? getCodexLiveAuthPath() : store.settings.opencodeAuthPath;
+}
+
+function getLoginCommand(mode: AuthMode) {
+  return mode === "codex" ? "codex login" : "opencode auth login";
+}
+
+function getTargetAuthPath(store: AppStore, mode: AuthMode = store.settings.currentMode) {
+  return mode === "codex" ? store.settings.codexAuthPath : store.settings.opencodeAuthPath;
+}
+
+function getActiveAccountId(store: AppStore, mode: AuthMode = store.settings.currentMode) {
+  return mode === "codex" ? store.activeCodexAccountId : store.activeOpenCodeAccountId;
+}
+
+function assignActiveAccountId(store: AppStore, accountId: string | null, mode: AuthMode = store.settings.currentMode): AppStore {
+  return {
+    ...store,
+    ...(mode === "codex" ? { activeCodexAccountId: accountId } : { activeOpenCodeAccountId: accountId })
+  };
 }
 
 function createWindow() {
@@ -216,14 +246,13 @@ async function importManagedAccountWithQuota(
   }
 
   const nextStore = {
-    ...store,
+    ...assignActiveAccountId(store, shouldActivateImportedAccount ? finalAccountId : getActiveAccountId(store)),
     revision: store.revision + 1,
-    activeAccountId: shouldActivateImportedAccount ? finalAccountId : store.activeAccountId,
-    accounts: sortAccounts(normalizeAutoLabels(hydratedAccounts), store.activeAccountId),
+    accounts: sortAccounts(normalizeAutoLabels(hydratedAccounts), getActiveAccountId(store)),
     history: recordHistory(store.history, historyEntries)
   };
 
-  nextStore.accounts = sortAccounts(nextStore.accounts, nextStore.activeAccountId);
+  nextStore.accounts = sortAccounts(nextStore.accounts, getActiveAccountId(nextStore));
 
   await saveStore(nextStore);
   const notices = getImportNotices(nextStore.accounts, finalAccountId);
@@ -238,7 +267,8 @@ async function importManagedAccountWithQuota(
 
 async function importAuthFiles(
   filePaths: string[],
-  store: Awaited<ReturnType<typeof loadStore>>
+  store: Awaited<ReturnType<typeof loadStore>>,
+  mode: AuthMode
 ): Promise<ImportResult> {
   let workingStore = store;
   let latestState = toDashboardState(store);
@@ -248,9 +278,9 @@ async function importAuthFiles(
   for (const filePath of filePaths) {
     try {
       const imported = await readJsonFile(filePath);
-      const picked = pickCodexAuthEntry(imported);
+      const picked = pickAuthEntryForMode(mode, imported);
       if (!picked) {
-        throw new Error("所选文件不包含 Codex/OpenAI OAuth 片段");
+        throw new Error(mode === "codex" ? "所选文件不包含 Codex auth" : "所选文件不包含 OpenCode auth");
       }
 
       const result = await importManagedAccountWithQuota(workingStore, picked.providerKey, picked.authFragment);
@@ -277,7 +307,8 @@ async function importAuthFiles(
 
 async function importAuthPayloads(
   payloads: Array<{ name: string; raw: string }>,
-  store: Awaited<ReturnType<typeof loadStore>>
+  store: Awaited<ReturnType<typeof loadStore>>,
+  mode: AuthMode
 ): Promise<ImportResult> {
   let workingStore = store;
   let latestState = toDashboardState(store);
@@ -287,9 +318,9 @@ async function importAuthPayloads(
   for (const payload of payloads) {
     try {
       const imported = JSON.parse(payload.raw) as unknown;
-      const picked = pickCodexAuthEntry(imported);
+      const picked = pickAuthEntryForMode(mode, imported);
       if (!picked) {
-        throw new Error("所选文件不包含 Codex/OpenAI OAuth 片段");
+        throw new Error(mode === "codex" ? "所选文件不包含 Codex auth" : "所选文件不包含 OpenCode auth");
       }
 
       const result = await importManagedAccountWithQuota(workingStore, picked.providerKey, picked.authFragment);
@@ -318,18 +349,17 @@ async function refreshAllState() {
   let store = await loadStore();
   let liveAuthSyncChangedActive = false;
 
-  const liveAuth = suppressLiveAuthSyncCount > 0 ? {} : await readOpenCodeAuthFile(store.settings.opencodeAuthPath);
+  const liveAuth = suppressLiveAuthSyncCount > 0 ? {} : await readOpenCodeAuthFile(getTargetAuthPath(store));
   const liveAuthEntry = suppressLiveAuthSyncCount > 0 ? null : pickCodexAuthEntry(liveAuth);
   if (liveAuthEntry?.authFragment?.access) {
-    const liveAuthSync = classifyLiveAuthSync(store.accounts, store.activeAccountId, liveAuthEntry.authFragment.access);
+    const liveAuthSync = classifyLiveAuthSync(store.accounts, getActiveAccountId(store), liveAuthEntry.authFragment.access);
     if (liveAuthSync.kind === "existing" || liveAuthSync.kind === "current") {
       const synced = upsertManagedAccount(store.accounts, liveAuthEntry.providerKey, liveAuthEntry.authFragment);
       liveAuthSyncChangedActive = liveAuthSync.changedActiveAccount;
-      store = {
+      store = assignActiveAccountId({
         ...store,
-        activeAccountId: synced.accountId,
         accounts: sortAccounts(normalizeAutoLabels(synced.accounts), synced.accountId)
-      };
+      }, synced.accountId);
     } else if (liveAuthSync.kind === "new") {
       await importManagedAccountWithQuota(store, liveAuthEntry.providerKey, liveAuthEntry.authFragment, {
         abortOnSameTeam: false,
@@ -350,15 +380,17 @@ async function refreshAllState() {
   const nextStore = {
     ...store,
     revision: store.revision + 1,
-    accounts: sortAccounts(normalizeAutoLabels(refreshedAccounts), store.activeAccountId),
+    accounts: sortAccounts(normalizeAutoLabels(refreshedAccounts), getActiveAccountId(store)),
     history: recordHistory(store.history, historyEntries)
   };
 
-  const replacementAccount = liveAuthSyncChangedActive ? null : pickAutoSwitchAccount(nextStore.accounts, nextStore.activeAccountId);
+  const replacementAccount = liveAuthSyncChangedActive ? null : pickAutoSwitchAccount(nextStore.accounts, getActiveAccountId(nextStore));
   if (replacementAccount) {
     try {
-      await mergeAccountIntoOpenCodeAuth(store.settings.opencodeAuthPath, replacementAccount);
-      nextStore.activeAccountId = replacementAccount.id;
+      await mergeAccountIntoOpenCodeAuth(getTargetAuthPath(store), replacementAccount);
+      const storeWithActive = assignActiveAccountId(nextStore, replacementAccount.id);
+      nextStore.activeOpenCodeAccountId = storeWithActive.activeOpenCodeAccountId;
+      nextStore.activeCodexAccountId = storeWithActive.activeCodexAccountId;
       nextStore.accounts = sortAccounts(
         nextStore.accounts.map((account: ManagedAccount) =>
           account.id === replacementAccount.id
@@ -384,18 +416,17 @@ async function refreshAccountState(accountId: string) {
   let store = await loadStore();
   let liveAuthSyncChangedActive = false;
 
-  const liveAuth = suppressLiveAuthSyncCount > 0 ? {} : await readOpenCodeAuthFile(store.settings.opencodeAuthPath);
+  const liveAuth = suppressLiveAuthSyncCount > 0 ? {} : await readOpenCodeAuthFile(getTargetAuthPath(store));
   const liveAuthEntry = suppressLiveAuthSyncCount > 0 ? null : pickCodexAuthEntry(liveAuth);
   if (liveAuthEntry?.authFragment?.access) {
-    const liveAuthSync = classifyLiveAuthSync(store.accounts, store.activeAccountId, liveAuthEntry.authFragment.access);
+    const liveAuthSync = classifyLiveAuthSync(store.accounts, getActiveAccountId(store), liveAuthEntry.authFragment.access);
     if (liveAuthSync.kind === "existing" || liveAuthSync.kind === "current") {
       const synced = upsertManagedAccount(store.accounts, liveAuthEntry.providerKey, liveAuthEntry.authFragment);
       liveAuthSyncChangedActive = liveAuthSync.changedActiveAccount;
-      store = {
+      store = assignActiveAccountId({
         ...store,
-        activeAccountId: synced.accountId,
         accounts: sortAccounts(normalizeAutoLabels(synced.accounts), synced.accountId)
-      };
+      }, synced.accountId);
     } else if (liveAuthSync.kind === "new") {
       await importManagedAccountWithQuota(store, liveAuthEntry.providerKey, liveAuthEntry.authFragment, {
         abortOnSameTeam: false,
@@ -420,26 +451,28 @@ async function refreshAccountState(accountId: string) {
   let nextStore = {
     ...store,
     revision: store.revision + 1,
-    accounts: sortAccounts(normalizeAutoLabels(refreshedAccounts), store.activeAccountId),
+    accounts: sortAccounts(normalizeAutoLabels(refreshedAccounts), getActiveAccountId(store)),
     history: recordHistory(store.history, historyEntries)
   };
 
-  const activeAccount = nextStore.accounts.find((account: ManagedAccount) => account.id === nextStore.activeAccountId) ?? null;
+  const activeAccount = nextStore.accounts.find((account: ManagedAccount) => account.id === getActiveAccountId(nextStore)) ?? null;
   if (!liveAuthSyncChangedActive && activeAccount && (getUsableFiveHourRemaining(activeAccount) ?? 0) <= 0) {
-    const refreshedCandidates = await refreshAutoSwitchCandidates(nextStore.accounts, nextStore.activeAccountId, batchAt);
+    const refreshedCandidates = await refreshAutoSwitchCandidates(nextStore.accounts, getActiveAccountId(nextStore), batchAt);
     historyEntries = [...historyEntries, ...refreshedCandidates.historyEntries];
     nextStore = {
       ...nextStore,
-      accounts: sortAccounts(normalizeAutoLabels(refreshedCandidates.accounts), nextStore.activeAccountId),
+      accounts: sortAccounts(normalizeAutoLabels(refreshedCandidates.accounts), getActiveAccountId(nextStore)),
       history: recordHistory(store.history, historyEntries)
     };
   }
 
-  const replacementAccount = liveAuthSyncChangedActive ? null : pickAutoSwitchAccount(nextStore.accounts, nextStore.activeAccountId);
+  const replacementAccount = liveAuthSyncChangedActive ? null : pickAutoSwitchAccount(nextStore.accounts, getActiveAccountId(nextStore));
   if (replacementAccount) {
     try {
-      await mergeAccountIntoOpenCodeAuth(store.settings.opencodeAuthPath, replacementAccount);
-      nextStore.activeAccountId = replacementAccount.id;
+      await mergeAccountIntoOpenCodeAuth(getTargetAuthPath(store), replacementAccount);
+      const storeWithActive = assignActiveAccountId(nextStore, replacementAccount.id);
+      nextStore.activeOpenCodeAccountId = storeWithActive.activeOpenCodeAccountId;
+      nextStore.activeCodexAccountId = storeWithActive.activeCodexAccountId;
       nextStore.accounts = sortAccounts(
         nextStore.accounts.map((account: ManagedAccount) =>
           account.id === replacementAccount.id
@@ -465,7 +498,7 @@ async function bootstrapState(): Promise<DashboardState> {
   const store = await loadStore();
   const nextStore = {
     ...store,
-    accounts: sortAccounts(store.accounts, store.activeAccountId)
+    accounts: sortAccounts(store.accounts, getActiveAccountId(store))
   };
   return toDashboardState(nextStore);
 }
@@ -475,14 +508,16 @@ function registerIpcHandlers() {
   ipcMain.handle("dashboard:refresh-all", async () => runStoreMutation(() => refreshAllState()));
   ipcMain.handle("dashboard:refresh-account", async (_event: unknown, accountId: string) => runStoreMutation(() => refreshAccountState(accountId)));
 
-  ipcMain.handle("settings:update", async (_event: unknown, patch: { opencodeAuthPath?: string; pollIntervalMs?: number }) => runStoreMutation(async () => {
+  ipcMain.handle("settings:update", async (_event: unknown, patch: { currentMode?: AuthMode; opencodeAuthPath?: string; codexAuthPath?: string; pollIntervalMs?: number }) => runStoreMutation(async () => {
     const store = await loadStore();
     const nextStore = {
       ...store,
       revision: store.revision + 1,
       settings: {
         ...store.settings,
+        ...(patch.currentMode === "opencode" || patch.currentMode === "codex" ? { currentMode: patch.currentMode } : {}),
         ...(patch.opencodeAuthPath ? { opencodeAuthPath: patch.opencodeAuthPath } : {}),
+        ...(patch.codexAuthPath ? { codexAuthPath: patch.codexAuthPath } : {}),
         ...(typeof patch.pollIntervalMs === "number" ? { pollIntervalMs: Math.max(60000, patch.pollIntervalMs) } : {})
       }
     };
@@ -492,7 +527,7 @@ function registerIpcHandlers() {
 
   ipcMain.handle("settings:pick-auth-path", async () => runStoreMutation(async () => {
     const result = await dialog.showOpenDialog({
-      title: "Choose Codex auth.json",
+      title: "Choose target auth.json",
       filters: [{ name: "JSON", extensions: ["json"] }],
       properties: ["openFile"]
     });
@@ -506,7 +541,9 @@ function registerIpcHandlers() {
       revision: store.revision + 1,
       settings: {
         ...store.settings,
-        opencodeAuthPath: result.filePaths[0]
+        ...(store.settings.currentMode === "codex"
+          ? { codexAuthPath: result.filePaths[0] }
+          : { opencodeAuthPath: result.filePaths[0] })
       }
     };
     await saveStore(nextStore);
@@ -515,10 +552,13 @@ function registerIpcHandlers() {
 
   ipcMain.handle("accounts:import-live", async () => runStoreMutation(async () => {
     const store = await loadStore();
-    const liveAuth = await readOpenCodeAuthFile(store.settings.opencodeAuthPath);
-    const picked = pickCodexAuthEntry(liveAuth);
+    const mode = store.settings.currentMode;
+    const liveAuth = await readOpenCodeAuthFile(getLiveImportPath(store, mode));
+    const picked = pickAuthEntryForMode(mode, liveAuth);
     if (!picked) {
-      throw new Error("No Codex/OpenAI OAuth entry was found in the configured auth file.");
+      throw new Error(mode === "codex"
+        ? "No Codex auth entry was found in the live Codex auth file."
+        : "No Codex/OpenAI OAuth entry was found in the configured auth file.");
     }
     const importedResult = await importManagedAccountWithQuota(store, picked.providerKey, picked.authFragment);
     return importedResult;
@@ -526,55 +566,61 @@ function registerIpcHandlers() {
 
   ipcMain.handle("accounts:login-import", async () => runStoreMutation(async () => {
     const store = await loadStore();
-    const authSnapshot = await captureJsonFileSnapshot(store.settings.opencodeAuthPath);
+    const mode = store.settings.currentMode;
+    const liveImportPath = getLiveImportPath(store, mode);
+    const authSnapshot = await captureJsonFileSnapshot(liveImportPath);
     suppressLiveAuthSyncCount += 1;
 
     try {
-      await new Promise((resolve, reject) => {
-        const child = spawn(
-          "powershell.exe",
-          [
-            "-NoProfile",
-            "-Command",
-            "Start-Process cmd.exe -ArgumentList '/c opencode auth login' -Wait"
-          ],
-          {
-            windowsHide: false,
-            cwd: process.cwd(),
-            stdio: "ignore"
-          }
-        );
-
-        child.once("error", reject);
-        child.once("exit", (code: number | null) => {
-          if (code === 0) {
-            resolve(null);
-          } else {
-            reject(new Error(`opencode auth login exited with code ${code}`));
-          }
-        });
-      });
-
-      let picked;
-      try {
-        const liveAuth = await readOpenCodeAuthFile(store.settings.opencodeAuthPath);
-        picked = pickCodexAuthEntry(liveAuth);
-        if (!picked) {
-          throw new Error("No Codex/OpenAI OAuth entry was found in the configured auth file after login.");
+    await new Promise((resolve, reject) => {
+      const child = spawn(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-Command",
+          `Start-Process cmd.exe -ArgumentList '/c ${getLoginCommand(mode)}' -Wait`
+        ],
+        {
+          windowsHide: false,
+          cwd: process.cwd(),
+          stdio: "ignore"
         }
-      } finally {
-        await restoreJsonFileSnapshot(store.settings.opencodeAuthPath, authSnapshot);
-      }
-      const importedResult = await importManagedAccountWithQuota(store, picked.providerKey, picked.authFragment);
-      return importedResult;
+      );
+
+      child.once("error", reject);
+      child.once("exit", (code: number | null) => {
+        if (code === 0) {
+          resolve(null);
+        } else {
+          reject(new Error(`${mode === "codex" ? "codex login" : "opencode auth login"} exited with code ${code}`));
+        }
+      });
+    });
+
+    let picked;
+    try {
+      const liveAuth = await readOpenCodeAuthFile(liveImportPath);
+      picked = pickAuthEntryForMode(mode, liveAuth);
+    } finally {
+      await restoreJsonFileSnapshot(liveImportPath, authSnapshot);
+    }
+    if (!picked) {
+      throw new Error(mode === "codex"
+        ? "No Codex auth entry was found in the live Codex auth file after login."
+        : "No Codex/OpenAI OAuth entry was found in the configured auth file after login.");
+    }
+
+    const importedResult = await importManagedAccountWithQuota(store, picked.providerKey, picked.authFragment);
+    return importedResult;
     } finally {
       suppressLiveAuthSyncCount = Math.max(0, suppressLiveAuthSyncCount - 1);
     }
   }));
 
   ipcMain.handle("accounts:import-file", async () => runStoreMutation(async () => {
+    const store = await loadStore();
     const dialogResult = await dialog.showOpenDialog({
-      title: "Import Codex auth JSON files",
+      title: store.settings.currentMode === "codex" ? "Import Codex auth JSON files" : "Import OpenCode auth JSON files",
       buttonLabel: "Import selected JSON files",
       filters: [{ name: "JSON", extensions: ["json"] }],
       properties: ["openFile", "multiSelections"]
@@ -583,8 +629,7 @@ function registerIpcHandlers() {
       return null;
     }
 
-    const store = await loadStore();
-    return importAuthFiles(dialogResult.filePaths, store);
+    return importAuthFiles(dialogResult.filePaths, store, store.settings.currentMode);
   }));
 
   ipcMain.handle("accounts:import-file-payloads", async (_event: unknown, payloads: Array<{ name: string; raw: string }>) => runStoreMutation(async () => {
@@ -593,7 +638,7 @@ function registerIpcHandlers() {
     }
 
     const store = await loadStore();
-    return importAuthPayloads(payloads, store);
+    return importAuthPayloads(payloads, store, store.settings.currentMode);
   }));
 
   ipcMain.handle("accounts:rename", async (_event: unknown, accountId: string, label: string) => runStoreMutation(async () => {
@@ -612,11 +657,14 @@ function registerIpcHandlers() {
   ipcMain.handle("accounts:delete", async (_event: unknown, accountId: string) => runStoreMutation(async () => {
     const store = await loadStore();
     const nextAccounts = store.accounts.filter((account: ManagedAccount) => account.id !== accountId);
+    const nextOpenCodeActiveId = store.activeOpenCodeAccountId === accountId ? null : store.activeOpenCodeAccountId;
+    const nextCodexActiveId = store.activeCodexAccountId === accountId ? null : store.activeCodexAccountId;
     const nextStore = {
       ...store,
       revision: store.revision + 1,
-      accounts: sortAccounts(normalizeAutoLabels(nextAccounts), store.activeAccountId === accountId ? null : store.activeAccountId),
-      activeAccountId: store.activeAccountId === accountId ? null : store.activeAccountId,
+      accounts: sortAccounts(normalizeAutoLabels(nextAccounts), store.settings.currentMode === "codex" ? nextCodexActiveId : nextOpenCodeActiveId),
+      activeOpenCodeAccountId: nextOpenCodeActiveId,
+      activeCodexAccountId: nextCodexActiveId,
       history: store.history.filter((entry: HistoryEntry) => entry.accountId !== accountId)
     };
     await saveStore(nextStore);
@@ -629,14 +677,18 @@ function registerIpcHandlers() {
     if (!account) {
       throw new Error("Managed account not found.");
     }
+    if (!canUseAccountInMode(account, store.settings.currentMode)) {
+      throw new Error(store.settings.currentMode === "codex"
+        ? "This account cannot be used in Codex mode."
+        : "This account cannot be used in OpenCode mode.");
+    }
 
     const timestamp = new Date().toISOString();
     const refreshedTarget = await refreshManagedAccountSnapshot(account, timestamp);
-    await mergeAccountIntoOpenCodeAuth(store.settings.opencodeAuthPath, refreshedTarget.account);
+    await mergeAccountIntoOpenCodeAuth(getTargetAuthPath(store), refreshedTarget.account);
     const nextStore = {
-      ...store,
+      ...assignActiveAccountId(store, accountId),
       revision: store.revision + 1,
-      activeAccountId: accountId,
       history: recordHistory(store.history, refreshedTarget.historyEntries),
       accounts: sortAccounts(normalizeAutoLabels(
         store.accounts.map((item: ManagedAccount) =>
@@ -658,14 +710,16 @@ function registerIpcHandlers() {
 
   ipcMain.handle("accounts:export", async (_event: unknown, accountIds?: string | string[]) => {
     const store = await loadStore();
+    const mode = store.settings.currentMode;
     const normalizedAccountIds = Array.isArray(accountIds)
       ? accountIds
       : typeof accountIds === "string" && accountIds.trim().length > 0
         ? [accountIds]
         : [];
-    const targetIds = normalizedAccountIds.length > 0 ? normalizedAccountIds : store.accounts.map((account: ManagedAccount) => account.id);
+    const modeAccounts = store.accounts.filter((account: ManagedAccount) => canUseAccountInMode(account, mode));
+    const targetIds = normalizedAccountIds.length > 0 ? normalizedAccountIds : modeAccounts.map((account: ManagedAccount) => account.id);
     const accounts = targetIds
-      .map((accountId: string) => store.accounts.find((item: ManagedAccount) => item.id === accountId) ?? null)
+      .map((accountId: string) => modeAccounts.find((item: ManagedAccount) => item.id === accountId) ?? null)
       .filter((account: ManagedAccount | null): account is ManagedAccount => Boolean(account));
 
     if (accounts.length === 0) {
@@ -675,14 +729,14 @@ function registerIpcHandlers() {
     if (accounts.length === 1) {
       const [account] = accounts;
       const result = await dialog.showSaveDialog({
-        title: "Export Codex auth",
-        defaultPath: `${sanitizeExportFileName(account.label)}.codex-auth.json`,
+        title: mode === "codex" ? "Export Codex auth" : "Export OpenCode auth",
+        defaultPath: `${sanitizeExportFileName(account.label)}${mode === "codex" ? ".codex-auth.json" : ".opencode-auth.json"}`,
         filters: [{ name: "JSON", extensions: ["json"] }]
       });
       if (result.canceled || !result.filePath) {
         return null;
       }
-      await writeJsonAtomic(result.filePath, await buildExportPayload(account));
+      await writeJsonAtomic(result.filePath, await buildExportPayload(account, mode));
       const exportResult: ExportResult = {
         exportedAccountIds: [account.id],
         filePaths: [result.filePath]
@@ -691,7 +745,7 @@ function registerIpcHandlers() {
     }
 
     const result = await dialog.showOpenDialog({
-      title: "Export Codex auth batch",
+      title: mode === "codex" ? "Export Codex auth batch" : "Export OpenCode auth batch",
       properties: ["openDirectory", "createDirectory"]
     });
     if (result.canceled || result.filePaths.length === 0) {
@@ -700,8 +754,8 @@ function registerIpcHandlers() {
     const exportDirectory = result.filePaths[0];
     const filePaths: string[] = [];
     for (const account of accounts) {
-      const filePath = path.join(exportDirectory, `${sanitizeExportFileName(account.label)}-${account.id.slice(0, 8)}.codex-auth.json`);
-      await writeJsonAtomic(filePath, await buildExportPayload(account));
+      const filePath = path.join(exportDirectory, `${sanitizeExportFileName(account.label)}-${account.id.slice(0, 8)}${mode === "codex" ? ".codex-auth.json" : ".opencode-auth.json"}`);
+      await writeJsonAtomic(filePath, await buildExportPayload(account, mode));
       filePaths.push(filePath);
     }
 
