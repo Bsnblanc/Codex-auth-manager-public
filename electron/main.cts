@@ -19,7 +19,7 @@ const { getImportNotices, getSameTeamAbortMessage } = require("./import-notices.
 const { classifyLiveAuthSync } = require("./live-auth-sync.js");
 const { fetchQuotaSnapshot } = require("./quotas.js");
 const { loadStore, recordHistory, saveStore, toDashboardState } = require("./store.js");
-const { pickAutoSwitchAccount } = require("./auto-switch.js");
+const { getUsableFiveHourRemaining, pickAutoSwitchAccount } = require("./auto-switch.js");
 
 let storeMutationQueue: Promise<void> = Promise.resolve();
 let suppressLiveAuthSyncCount = 0;
@@ -67,6 +67,71 @@ function sortAccounts(accounts: ManagedAccount[], activeAccountId: string | null
     if (right.id === activeAccountId) return 1;
     return left.createdAt.localeCompare(right.createdAt);
   });
+}
+
+async function refreshManagedAccountSnapshot(
+  account: ManagedAccount,
+  batchAt: string,
+  options?: { throwOnError?: boolean }
+): Promise<{ account: ManagedAccount; historyEntries: HistoryEntry[] }> {
+  try {
+    const snapshot = await fetchQuotaSnapshot(account, batchAt);
+    return {
+      account: {
+        ...account,
+        updatedAt: batchAt,
+        email: snapshot.email ?? account.email,
+        accountId: snapshot.accountId ?? account.accountId,
+        planType: snapshot.planType ?? account.planType,
+        jwtMetadata: snapshot.jwtMetadata ?? account.jwtMetadata,
+        lastQuota: snapshot,
+        lastError: null
+      },
+      historyEntries: [{
+        accountId: account.id,
+        batchAt,
+        windows: snapshot.windows
+      }]
+    };
+  } catch (error) {
+    if (options?.throwOnError) {
+      throw error;
+    }
+
+    return {
+      account: {
+        ...account,
+        updatedAt: batchAt,
+        jwtMetadata: account.jwtMetadata,
+        lastError: error instanceof Error ? error.message : String(error)
+      },
+      historyEntries: []
+    };
+  }
+}
+
+async function refreshAutoSwitchCandidates(
+  accounts: ManagedAccount[],
+  activeAccountId: string | null,
+  batchAt: string
+): Promise<{ accounts: ManagedAccount[]; historyEntries: HistoryEntry[] }> {
+  const refreshed = await Promise.all(
+    accounts.map(async (account: ManagedAccount) => {
+      if (account.id === activeAccountId) {
+        return {
+          account,
+          historyEntries: [] as HistoryEntry[]
+        };
+      }
+
+      return refreshManagedAccountSnapshot(account, batchAt);
+    })
+  );
+
+  return {
+    accounts: refreshed.map((item) => item.account),
+    historyEntries: refreshed.flatMap((item) => item.historyEntries)
+  };
 }
 
 async function importManagedAccountWithQuota(
@@ -276,37 +341,11 @@ async function refreshAllState() {
   }
 
   const batchAt = new Date().toISOString();
-  const historyEntries: HistoryEntry[] = [];
-
-  const refreshedAccounts = await Promise.all(
-    store.accounts.map(async (account: ManagedAccount) => {
-      try {
-        const snapshot = await fetchQuotaSnapshot(account, batchAt);
-        historyEntries.push({
-          accountId: account.id,
-          batchAt,
-          windows: snapshot.windows
-        });
-        return {
-            ...account,
-            updatedAt: batchAt,
-            email: snapshot.email ?? account.email,
-            accountId: snapshot.accountId ?? account.accountId,
-            planType: snapshot.planType ?? account.planType,
-            jwtMetadata: snapshot.jwtMetadata ?? account.jwtMetadata,
-            lastQuota: snapshot,
-            lastError: null
-          };
-      } catch (error) {
-        return {
-            ...account,
-            updatedAt: batchAt,
-            jwtMetadata: account.jwtMetadata,
-            lastError: error instanceof Error ? error.message : String(error)
-          };
-      }
-    })
+  const refreshedResults = await Promise.all(
+    store.accounts.map((account: ManagedAccount) => refreshManagedAccountSnapshot(account, batchAt))
   );
+  const refreshedAccounts = refreshedResults.map((result) => result.account);
+  const historyEntries = refreshedResults.flatMap((result) => result.historyEntries);
 
   const nextStore = {
     ...store,
@@ -373,42 +412,28 @@ async function refreshAccountState(accountId: string) {
   }
 
   const batchAt = new Date().toISOString();
-  const historyEntries: HistoryEntry[] = [];
-
-  let refreshedAccount: ManagedAccount;
-  try {
-    const snapshot = await fetchQuotaSnapshot(targetAccount, batchAt);
-    historyEntries.push({
-      accountId: targetAccount.id,
-      batchAt,
-      windows: snapshot.windows
-    });
-    refreshedAccount = {
-      ...targetAccount,
-      updatedAt: batchAt,
-      email: snapshot.email ?? targetAccount.email,
-      accountId: snapshot.accountId ?? targetAccount.accountId,
-      planType: snapshot.planType ?? targetAccount.planType,
-      jwtMetadata: snapshot.jwtMetadata ?? targetAccount.jwtMetadata,
-      lastQuota: snapshot,
-      lastError: null
-    };
-  } catch (error) {
-    refreshedAccount = {
-      ...targetAccount,
-      updatedAt: batchAt,
-      jwtMetadata: targetAccount.jwtMetadata,
-      lastError: error instanceof Error ? error.message : String(error)
-    };
-  }
+  const refreshedTargetResult = await refreshManagedAccountSnapshot(targetAccount, batchAt);
+  let historyEntries = [...refreshedTargetResult.historyEntries];
+  let refreshedAccount = refreshedTargetResult.account;
 
   const refreshedAccounts = store.accounts.map((account: ManagedAccount) => account.id === accountId ? refreshedAccount : account);
-  const nextStore = {
+  let nextStore = {
     ...store,
     revision: store.revision + 1,
     accounts: sortAccounts(normalizeAutoLabels(refreshedAccounts), store.activeAccountId),
     history: recordHistory(store.history, historyEntries)
   };
+
+  const activeAccount = nextStore.accounts.find((account: ManagedAccount) => account.id === nextStore.activeAccountId) ?? null;
+  if (!liveAuthSyncChangedActive && activeAccount && (getUsableFiveHourRemaining(activeAccount) ?? 0) <= 0) {
+    const refreshedCandidates = await refreshAutoSwitchCandidates(nextStore.accounts, nextStore.activeAccountId, batchAt);
+    historyEntries = [...historyEntries, ...refreshedCandidates.historyEntries];
+    nextStore = {
+      ...nextStore,
+      accounts: sortAccounts(normalizeAutoLabels(refreshedCandidates.accounts), nextStore.activeAccountId),
+      history: recordHistory(store.history, historyEntries)
+    };
+  }
 
   const replacementAccount = liveAuthSyncChangedActive ? null : pickAutoSwitchAccount(nextStore.accounts, nextStore.activeAccountId);
   if (replacementAccount) {
@@ -467,7 +492,7 @@ function registerIpcHandlers() {
 
   ipcMain.handle("settings:pick-auth-path", async () => runStoreMutation(async () => {
     const result = await dialog.showOpenDialog({
-      title: "Choose OpenCode auth.json",
+      title: "Choose Codex auth.json",
       filters: [{ name: "JSON", extensions: ["json"] }],
       properties: ["openFile"]
     });
@@ -493,7 +518,7 @@ function registerIpcHandlers() {
     const liveAuth = await readOpenCodeAuthFile(store.settings.opencodeAuthPath);
     const picked = pickCodexAuthEntry(liveAuth);
     if (!picked) {
-      throw new Error("No Codex/OpenAI OAuth entry was found in the configured OpenCode auth file.");
+      throw new Error("No Codex/OpenAI OAuth entry was found in the configured auth file.");
     }
     const importedResult = await importManagedAccountWithQuota(store, picked.providerKey, picked.authFragment);
     return importedResult;
@@ -535,7 +560,7 @@ function registerIpcHandlers() {
         const liveAuth = await readOpenCodeAuthFile(store.settings.opencodeAuthPath);
         picked = pickCodexAuthEntry(liveAuth);
         if (!picked) {
-          throw new Error("No Codex/OpenAI OAuth entry was found in the configured OpenCode auth file after login.");
+          throw new Error("No Codex/OpenAI OAuth entry was found in the configured auth file after login.");
         }
       } finally {
         await restoreJsonFileSnapshot(store.settings.opencodeAuthPath, authSnapshot);
@@ -605,17 +630,19 @@ function registerIpcHandlers() {
       throw new Error("Managed account not found.");
     }
 
-    await mergeAccountIntoOpenCodeAuth(store.settings.opencodeAuthPath, account);
     const timestamp = new Date().toISOString();
+    const refreshedTarget = await refreshManagedAccountSnapshot(account, timestamp);
+    await mergeAccountIntoOpenCodeAuth(store.settings.opencodeAuthPath, refreshedTarget.account);
     const nextStore = {
       ...store,
       revision: store.revision + 1,
       activeAccountId: accountId,
+      history: recordHistory(store.history, refreshedTarget.historyEntries),
       accounts: sortAccounts(normalizeAutoLabels(
         store.accounts.map((item: ManagedAccount) =>
           item.id === accountId
             ? {
-                ...item,
+                ...refreshedTarget.account,
                 lastSyncedAt: timestamp,
                 updatedAt: timestamp
               }

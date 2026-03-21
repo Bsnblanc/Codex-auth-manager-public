@@ -7,12 +7,64 @@ import type { AuthFileRecord, AuthProviderEntry, ManagedAccount, ProviderKey } f
 
 const PREFERRED_KEYS: ProviderKey[] = ["opencode", "codex", "openai", "chatgpt"];
 
+type CodexDirectAuthFile = {
+  auth_mode?: string | null;
+  OPENAI_API_KEY?: string | null;
+  tokens?: {
+    id_token?: string | null;
+    access_token?: string | null;
+    refresh_token?: string | null;
+    account_id?: string | null;
+  } | null;
+  last_refresh?: string | null;
+};
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function isOauthEntry(value: unknown): value is AuthProviderEntry {
   return isObject(value) && value.type === "oauth" && typeof value.access === "string";
+}
+
+function isCodexDirectAuthFile(value: unknown): value is CodexDirectAuthFile {
+  if (!isObject(value)) {
+    return false;
+  }
+
+  const tokens = value["tokens"];
+  return isObject(tokens)
+    && typeof tokens["access_token"] === "string"
+    && typeof tokens["refresh_token"] === "string";
+}
+
+function toOpenCodeAuthFragment(fragment: AuthProviderEntry): AuthProviderEntry {
+  const { id_token: _idToken, auth_mode: _authMode, last_refresh: _lastRefresh, ...rest } = fragment;
+  return rest;
+}
+
+function buildDirectCodexAuthFile(fragment: AuthProviderEntry): CodexDirectAuthFile {
+  const accessToken = typeof fragment.access === "string" ? fragment.access : null;
+  const refreshToken = typeof fragment.refresh === "string" ? fragment.refresh : null;
+  const idToken = typeof fragment.id_token === "string" ? fragment.id_token : null;
+
+  if (!accessToken || !refreshToken || !idToken) {
+    throw new Error("Managed account is missing direct Codex auth fields and must be reacquired from a direct Codex auth file.");
+  }
+
+  return {
+    auth_mode: typeof fragment.auth_mode === "string" ? fragment.auth_mode : "chatgpt",
+    OPENAI_API_KEY: null,
+    tokens: {
+      id_token: idToken,
+      access_token: accessToken,
+      refresh_token: refreshToken,
+      account_id: typeof fragment.accountId === "string"
+        ? fragment.accountId
+        : getAccountIdFromJwt(accessToken)
+    },
+    last_refresh: typeof fragment.last_refresh === "string" ? fragment.last_refresh : new Date().toISOString()
+  };
 }
 
 export async function readJsonFile(filePath: string): Promise<unknown> {
@@ -30,6 +82,29 @@ export async function readOpenCodeAuthFile(filePath: string): Promise<AuthFileRe
 }
 
 export function pickCodexAuthEntry(source: unknown): { providerKey: ProviderKey; authFragment: AuthProviderEntry } | null {
+  if (isCodexDirectAuthFile(source)) {
+    const accessToken = source.tokens?.access_token;
+    const refreshToken = source.tokens?.refresh_token;
+    if (typeof accessToken !== "string" || typeof refreshToken !== "string") {
+      return null;
+    }
+
+    const jwtMetadata = getJwtMetadata(accessToken);
+    return {
+      providerKey: "codex",
+      authFragment: {
+        type: "oauth",
+        access: accessToken,
+        refresh: refreshToken,
+        expires: jwtMetadata?.expiresAt ? jwtMetadata.expiresAt * 1000 : undefined,
+        accountId: typeof source.tokens?.account_id === "string" ? source.tokens.account_id : undefined,
+        id_token: typeof source.tokens?.id_token === "string" ? source.tokens.id_token : undefined,
+        auth_mode: typeof source.auth_mode === "string" ? source.auth_mode : undefined,
+        last_refresh: typeof source.last_refresh === "string" ? source.last_refresh : undefined
+      }
+    };
+  }
+
   if (isOauthEntry(source)) {
     return {
       providerKey: "openai",
@@ -166,9 +241,14 @@ export async function writeJsonAtomic(filePath: string, payload: unknown) {
 
 export async function mergeAccountIntoOpenCodeAuth(filePath: string, account: ManagedAccount): Promise<void> {
   const authFile = await readOpenCodeAuthFile(filePath);
+  if (isCodexDirectAuthFile(authFile)) {
+    await writeJsonAtomic(filePath, buildDirectCodexAuthFile(account.authFragment));
+    return;
+  }
+
   const currentEntry = pickCodexAuthEntry(authFile);
   const targetKey = currentEntry?.providerKey ?? account.providerKey;
-  authFile[targetKey] = account.authFragment;
+  authFile[targetKey] = toOpenCodeAuthFragment(account.authFragment);
   await writeJsonAtomic(filePath, authFile);
 }
 

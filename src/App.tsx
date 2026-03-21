@@ -96,9 +96,9 @@ function normalizeErrorMessage(error: unknown) {
       return "未找到所选账号，请重新选择后重试。";
     case "No managed accounts were selected for export.":
       return "没有可导出的账号。";
-    case "No Codex/OpenAI OAuth entry was found in the configured OpenCode auth file.":
+    case "No Codex/OpenAI OAuth entry was found in the configured auth file.":
       return "当前 Auth 文件中没有找到 Codex/OpenAI OAuth 账号。";
-    case "No Codex/OpenAI OAuth entry was found in the configured OpenCode auth file after login.":
+    case "No Codex/OpenAI OAuth entry was found in the configured auth file after login.":
       return "登录完成后未在 Auth 文件中找到 Codex/OpenAI OAuth 账号。";
     default:
       return raw;
@@ -136,6 +136,7 @@ type AggregateBar = {
     remainingPercent: number;
     widthPercent: number;
     startPercent: number;
+    isHiddenByFocus: boolean;
   }>;
   stateMarkers: Array<{
     accountId: string;
@@ -144,6 +145,7 @@ type AggregateBar = {
     color: string;
     anchor: "start" | "center" | "end";
     status: "empty" | "unknown";
+    isHiddenByFocus: boolean;
   }>;
 };
 
@@ -156,6 +158,7 @@ type SeriesPoint = {
 const QUOTA_KEYS: QuotaWindowKey[] = ["fiveHour", "weekly", "codeReview"];
 
 const VISUAL_COLOR_STOPS = ["#2f8f63", "#4c8f8f", "#6f83b8", "#9a71b9", "#bd6f8d", "#c7834e", "#c89d49"];
+const AUTH_MENU_CLOSE_DELAY_MS = 220;
 
 function hexToRgb(value: string) {
   const numeric = Number.parseInt(value.slice(1), 16);
@@ -453,35 +456,10 @@ function getAccountNormalRefreshIntervalMs(account: ManagedAccount) {
   return minutes * 60 * 1000;
 }
 
-function getExhaustedWindowResetCandidates(account: ManagedAccount) {
+function getAccountResetCandidates(account: ManagedAccount) {
   const candidates: number[] = [];
-  const fiveHourWindow = getWindow(account, "fiveHour");
-  const weeklyWindow = getWindow(account, "weekly");
-  const codeReviewWindow = getWindow(account, "codeReview");
-
-  const rawFiveHourRemaining = fiveHourWindow?.remainingPercent;
-  const weeklyRemaining = weeklyWindow?.remainingPercent;
-  const reviewRemaining = codeReviewWindow?.remainingPercent;
-  const displayedFiveHourRemaining = getDisplayedRemainingPercent(account, "fiveHour");
-
-  if (displayedFiveHourRemaining !== null && displayedFiveHourRemaining <= 0) {
-    if (typeof rawFiveHourRemaining === "number" && rawFiveHourRemaining <= 0) {
-      const timeMs = parseIsoTime(fiveHourWindow?.resetAt ?? null);
-      if (timeMs !== null) {
-        candidates.push(timeMs);
-      }
-    }
-
-    if (typeof weeklyRemaining === "number" && weeklyRemaining <= 0) {
-      const timeMs = parseIsoTime(weeklyWindow?.resetAt ?? null);
-      if (timeMs !== null) {
-        candidates.push(timeMs);
-      }
-    }
-  }
-
-  if (typeof reviewRemaining === "number" && reviewRemaining <= 0) {
-    const timeMs = parseIsoTime(codeReviewWindow?.resetAt ?? null);
+  for (const quotaKey of QUOTA_KEYS) {
+    const timeMs = parseIsoTime(getWindow(account, quotaKey)?.resetAt ?? null);
     if (timeMs !== null) {
       candidates.push(timeMs);
     }
@@ -493,20 +471,30 @@ function getExhaustedWindowResetCandidates(account: ManagedAccount) {
 function getAccountNextRefreshAt(account: ManagedAccount, isActiveAccount: boolean, nowMs: number) {
   const lastKnownAt = parseIsoTime(account.lastQuota?.fetchedAt ?? account.updatedAt ?? account.createdAt) ?? nowMs;
   const dynamicIntervalMs = getAccountNormalRefreshIntervalMs(account);
-  const exhaustedResetCandidates = getExhaustedWindowResetCandidates(account).filter((timeMs) => timeMs > nowMs);
+  const nextResetAt = getAccountResetCandidates(account)[0] ?? null;
   const candidates: number[] = [];
 
-  if (dynamicIntervalMs !== null) {
+  if (isActiveAccount && dynamicIntervalMs !== null) {
     candidates.push(lastKnownAt + dynamicIntervalMs);
   }
 
-  if (exhaustedResetCandidates.length > 0) {
-    candidates.push(exhaustedResetCandidates[0]);
-  } else if (dynamicIntervalMs === null) {
-    candidates.push(nowMs + (isActiveAccount ? 5 : 30) * 60 * 1000);
+  if (nextResetAt !== null) {
+    candidates.push(Math.max(nextResetAt, nowMs));
   }
 
-  return Math.min(...candidates);
+  if (candidates.length > 0) {
+    return Math.min(...candidates);
+  }
+
+  if (isActiveAccount) {
+    return nowMs + 5 * 60 * 1000;
+  }
+
+  if (!account.lastQuota || account.lastError) {
+    return nowMs + 30 * 60 * 1000;
+  }
+
+  return null;
 }
 
 function getCreditsLabel(account: ManagedAccount, locale: Locale, unitLabel: string) {
@@ -538,19 +526,64 @@ function computeAggregateBars(accounts: ManagedAccount[], locale: Locale, focus:
   const meta = quotaMeta(locale);
   const scopedAccounts = accounts;
   return QUOTA_KEYS.map((quotaKey) => {
+    if (focus.kind === "account") {
+      const focusedAccount = scopedAccounts.find((account) => account.id === focus.accountId);
+      if (focusedAccount) {
+        const remainingPercent = getDisplayedRemainingPercent(focusedAccount, quotaKey);
+        const color = getQuotaBarColor(focusedAccount, scopedAccounts, quotaKey, focus);
+        const status = getDisplayedStatus(focusedAccount, quotaKey);
+        const filledPercent = clamp(remainingPercent ?? 0, 0, 100);
+        const stateMarkers: AggregateBar["stateMarkers"] =
+          remainingPercent === null || remainingPercent <= 0
+            ? [{
+                accountId: focusedAccount.id,
+                label: focusedAccount.label,
+                leftPercent: 0,
+                color,
+                anchor: "start",
+                status: status === "unknown" ? "unknown" : "empty",
+                isHiddenByFocus: false
+              }]
+            : [];
+
+        return {
+          quotaKey,
+          title: meta[quotaKey].title,
+          filledPercent,
+          hasLeadingMarker: stateMarkers.some((marker) => marker.anchor === "start"),
+          hasTrailingMarker: stateMarkers.some((marker) => marker.anchor === "end"),
+          segments: remainingPercent !== null && remainingPercent > 0
+            ? [{
+                accountId: focusedAccount.id,
+                label: focusedAccount.label,
+                color,
+                remainingPercent,
+                widthPercent: 100,
+                startPercent: 0,
+                isHiddenByFocus: false
+              }]
+            : [],
+          stateMarkers
+        };
+      }
+    }
+
     const windows = scopedAccounts
       .map((account) => ({ account, remainingPercent: getDisplayedRemainingPercent(account, quotaKey) }))
       .filter(({ remainingPercent }) => remainingPercent !== null && remainingPercent !== undefined);
 
     const knownWindows = windows as Array<{ account: ManagedAccount; remainingPercent: number }>;
     const positive = knownWindows.filter(({ remainingPercent }) => remainingPercent > 0);
-    const aggregateFilled = knownWindows.length
-      ? knownWindows.reduce((sum, { remainingPercent }) => sum + remainingPercent, 0) / knownWindows.length
-      : 0;
+    const aggregateFilled = focus.kind === "account"
+      ? (knownWindows.find(w => w.account.id === focus.accountId)?.remainingPercent ?? 0)
+      : knownWindows.length
+        ? knownWindows.reduce((sum, { remainingPercent }) => sum + remainingPercent, 0) / knownWindows.length
+        : 0;
 
     const totalPositive = positive.reduce((sum, { remainingPercent }) => sum + remainingPercent, 0);
     const rawStateMarkers: AggregateBar["stateMarkers"] = scopedAccounts.flatMap((account, index) => {
       const remainingPercent = getDisplayedRemainingPercent(account, quotaKey);
+      const isOtherFocused = focus.kind === "account" && focus.accountId !== account.id;
       const beforeTotal = scopedAccounts
         .slice(0, index)
         .reduce((sum, item) => sum + Math.max(getDisplayedRemainingPercent(item, quotaKey) ?? 0, 0), 0);
@@ -562,11 +595,11 @@ function computeAggregateBars(accounts: ManagedAccount[], locale: Locale, focus:
       const anchor = isLeadingBoundary ? "start" : isTrailingBoundary ? "end" : leftPercent >= 100 ? "end" : "center";
 
       if (remainingPercent === null) {
-        return [{ accountId: account.id, label: account.label, leftPercent, color: getQuotaBarColor(account, scopedAccounts, quotaKey, focus), anchor, status: "unknown" as const }];
+        return [{ accountId: account.id, label: account.label, leftPercent, color: getQuotaBarColor(account, scopedAccounts, quotaKey, focus), anchor, status: "unknown" as const, isHiddenByFocus: isOtherFocused }];
       }
 
       if (remainingPercent <= 0) {
-        return [{ accountId: account.id, label: account.label, leftPercent, color: getQuotaBarColor(account, scopedAccounts, quotaKey, focus), anchor, status: "empty" as const }];
+        return [{ accountId: account.id, label: account.label, leftPercent, color: getQuotaBarColor(account, scopedAccounts, quotaKey, focus), anchor, status: "empty" as const, isHiddenByFocus: isOtherFocused }];
       }
 
       return [] as AggregateBar["stateMarkers"];
@@ -605,14 +638,19 @@ function computeAggregateBars(accounts: ManagedAccount[], locale: Locale, focus:
       hasLeadingMarker,
       hasTrailingMarker,
       segments: positive.map(({ account, remainingPercent }) => {
-        const widthPercent = totalPositive > 0 ? (remainingPercent / totalPositive) * 100 : 0;
+        const isFocused = focus.kind === "account" && focus.accountId === account.id;
+        const isOtherFocused = focus.kind === "account" && focus.accountId !== account.id;
+        const widthPercent = focus.kind === "account"
+          ? (isFocused ? 100 : 0)
+          : totalPositive > 0 ? (remainingPercent / totalPositive) * 100 : 0;
         const segment = {
           accountId: account.id,
           label: account.label,
           color: getQuotaBarColor(account, scopedAccounts, quotaKey, focus),
           remainingPercent,
           widthPercent,
-          startPercent: runningStart
+          startPercent: runningStart,
+          isHiddenByFocus: isOtherFocused
         };
         runningStart += widthPercent;
         return segment;
@@ -1250,6 +1288,9 @@ export default function App() {
 
     for (const account of state.accounts) {
       const nextRefreshAt = getAccountNextRefreshAt(account, state.activeAccountId === account.id, Date.now());
+      if (nextRefreshAt === null) {
+        continue;
+      }
       const delayMs = Math.max(0, nextRefreshAt - Date.now());
 
       accountRefreshTimeoutsRef.current[account.id] = window.setTimeout(() => {
@@ -1349,7 +1390,7 @@ export default function App() {
       setGetAuthOpen(false);
       setAuthClosing(false);
       getAuthCloseTimerRef.current = null;
-    }, 180);
+    }, AUTH_MENU_CLOSE_DELAY_MS);
   }
 
   function handleGetAuthBlur(event: React.FocusEvent<HTMLDivElement>) {
@@ -1545,8 +1586,9 @@ export default function App() {
               {(() => {
                 const visibleStateMarkers = bar.stateMarkers;
                 const visibleSegments = bar.segments;
-                const hasVisibleLeadingMarker = visibleStateMarkers.some((marker) => marker.anchor === "start");
-                const hasVisibleTrailingMarker = visibleStateMarkers.some((marker) => marker.anchor === "end");
+                const renderedSegments = visibleSegments.filter((segment) => !segment.isHiddenByFocus);
+                const hasVisibleLeadingMarker = visibleStateMarkers.some((marker) => marker.anchor === "start" && !marker.isHiddenByFocus);
+                const hasVisibleTrailingMarker = visibleStateMarkers.some((marker) => marker.anchor === "end" && !marker.isHiddenByFocus);
                 const activeMarkerIdForBar = activeMarkerAccountId && (() => {
                   const activeAccount = state.accounts.find((account) => account.id === activeMarkerAccountId);
                   return activeAccount ? activeMarkerAccountId : null;
@@ -1567,13 +1609,13 @@ export default function App() {
                       const dimmed = activeVisualAccountId && activeVisualAccountId !== seg.accountId;
                       const focused = focus.kind === "account" && focus.accountId === seg.accountId;
                       const active = state.activeAccountId === seg.accountId;
-                      const segmentIndex = visibleSegments.findIndex((segment) => segment.accountId === seg.accountId);
+                      const segmentIndex = renderedSegments.findIndex((segment) => segment.accountId === seg.accountId);
                       const isFirstVisible = segmentIndex === 0;
-                      const isLastVisible = segmentIndex === visibleSegments.length - 1;
+                      const isLastVisible = segmentIndex === renderedSegments.length - 1;
                       return (
                         <div
                           key={seg.accountId}
-                          className={`quota-segment${dimmed ? " is-dimmed" : ""}${focused ? " is-focused" : ""}${active ? " is-active-account" : ""}${isFirstVisible && !hasVisibleLeadingMarker ? " is-round-start" : ""}${isLastVisible && !hasVisibleTrailingMarker ? " is-round-end" : ""}`}
+                          className={`quota-segment${dimmed ? " is-dimmed" : ""}${focused ? " is-focused" : ""}${active ? " is-active-account" : ""}${isFirstVisible && !hasVisibleLeadingMarker ? " is-round-start" : ""}${isLastVisible && !hasVisibleTrailingMarker ? " is-round-end" : ""}${seg.isHiddenByFocus ? " is-hidden-focus" : ""}`}
                           style={{ width: `${seg.widthPercent}%`, backgroundColor: seg.color }}
                           onMouseEnter={() => setHoveredAccountId(seg.accountId)}
                           onClick={(e) => { e.stopPropagation(); setHoveredAccountId(null); setFocus({ kind: "account", accountId: seg.accountId, quotaKey: bar.quotaKey }); }}
@@ -1624,7 +1666,7 @@ export default function App() {
                     {visibleStateMarkers.map((marker) => (
                         <div
                           key={`${marker.accountId}-${marker.status}`}
-                          className={`state-region is-${marker.status} is-${marker.anchor}${activeMarkerIdForBar === marker.accountId ? " is-active" : ""}${activeVisualAccountId && activeVisualAccountId !== marker.accountId ? " is-dimmed" : ""}`}
+                          className={`state-region is-${marker.status} is-${marker.anchor}${activeMarkerIdForBar === marker.accountId ? " is-active" : ""}${activeVisualAccountId && activeVisualAccountId !== marker.accountId ? " is-dimmed" : ""}${marker.isHiddenByFocus ? " is-hidden-focus" : ""}`}
                           style={{ left: `${marker.leftPercent}%`, color: marker.color, transform: marker.anchor === "start" ? "translateX(0)" : marker.anchor === "end" ? "translateX(-100%)" : "translateX(-50%)" }}
                           title={`${marker.label} - ${marker.status === "empty" ? text.empty : text.unknown}`}
                         onMouseEnter={() => setHoveredAccountId(marker.accountId)}

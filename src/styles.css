@@ -266,12 +266,7 @@ button {
 
 .auth-toolbar-button .button-text,
 .auth-toolbar-button .toolbar-utility {
-  transition: max-width 220ms cubic-bezier(0.22, 1, 0.36, 1), opacity 45ms ease;
-}
-
-.auth-toolbar-button.is-closing .button-text,
-.auth-toolbar-button.is-closing .toolbar-utility {
-  opacity: 0;
+  transition: max-width 220ms cubic-bezier(0.22, 1, 0.36, 1), opacity 180ms ease;
 }
 
 .toolbar-leading-icon {
@@ -799,6 +794,13 @@ button {
 
 .quota-segment.is-focused {
   transform: scaleY(1.06);
+  z-index: 2;
+}
+
+.quota-segment.is-hidden-focus {
+  opacity: 0;
+  width: 0 !important;
+  pointer-events: none;
 }
 
 .quota-segment.is-round-start {
@@ -1003,7 +1005,10 @@ button {
 
 .state-region.is-hidden,
 .state-region.is-start.is-hidden,
-.state-region.is-end.is-hidden {
+.state-region.is-end.is-hidden,
+.state-region.is-hidden-focus,
+.state-region.is-start.is-hidden-focus,
+.state-region.is-end.is-hidden-focus {
   opacity: 0;
   width: 0;
   pointer-events: none;
