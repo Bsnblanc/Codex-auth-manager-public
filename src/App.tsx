@@ -53,7 +53,6 @@ type DashboardState = {
     currentMode: AuthMode;
     opencodeAuthPath: string;
     codexAuthPath: string;
-    pollIntervalMs: number;
   };
   activeOpenCodeAccountId: string | null;
   activeCodexAccountId: string | null;
@@ -92,8 +91,7 @@ function isDashboardState(value: unknown): value is DashboardState {
     && typeof candidate.activeCodexAccountId !== "undefined"
     && (candidate.settings?.currentMode === "opencode" || candidate.settings?.currentMode === "codex")
     && typeof candidate.settings?.opencodeAuthPath === "string"
-    && typeof candidate.settings?.codexAuthPath === "string"
-    && typeof candidate.settings?.pollIntervalMs === "number";
+    && typeof candidate.settings?.codexAuthPath === "string";
 }
 
 function normalizeErrorMessage(error: unknown) {
@@ -109,6 +107,11 @@ function normalizeErrorMessage(error: unknown) {
     case "No Codex auth entry was found in the live Codex auth file after login.":
     case "No Codex/OpenAI OAuth entry was found in the configured auth file after login.":
       return "登录完成后未在 Auth 文件中找到 Codex/OpenAI OAuth 账号。";
+    case "Codex login did not create or update auth.":
+    case "OpenCode login did not create or update auth.":
+      return "登录未生成新的授权，请确认已完成登录。";
+    case "No supported OpenCode or Codex auth entry was found in the selected file.":
+      return "所选文件中没有找到可识别的 OpenCode 或 Codex 授权信息。";
     default:
       return raw;
   }
@@ -120,8 +123,7 @@ function emptyDashboardState(): DashboardState {
     settings: {
       currentMode: "opencode",
       opencodeAuthPath: "",
-      codexAuthPath: "",
-      pollIntervalMs: 600000
+      codexAuthPath: ""
     },
     activeOpenCodeAccountId: null,
     activeCodexAccountId: null,
@@ -171,6 +173,7 @@ const QUOTA_KEYS: QuotaWindowKey[] = ["fiveHour", "weekly", "codeReview"];
 
 const VISUAL_COLOR_STOPS = ["#2f8f63", "#4c8f8f", "#6f83b8", "#9a71b9", "#bd6f8d", "#c7834e", "#c89d49"];
 const AUTH_MENU_CLOSE_DELAY_MS = 220;
+const IMPORT_SPOTLIGHT_DURATION_MS = 1800;
 
 function hexToRgb(value: string) {
   const numeric = Number.parseInt(value.slice(1), 16);
@@ -208,9 +211,27 @@ function getAccountColor(account: ManagedAccount, accounts: ManagedAccount[]): s
   return interpolateColor(VISUAL_COLOR_STOPS[leftIndex], VISUAL_COLOR_STOPS[rightIndex], scaled - leftIndex);
 }
 
+function isInvalidAccount(account: ManagedAccount) {
+  return account.lastError !== null;
+}
+
+function sortVisibleAccounts(accounts: ManagedAccount[], activeAccountId: string | null) {
+  return [...accounts].sort((left, right) => {
+    if (left.id === activeAccountId) return -1;
+    if (right.id === activeAccountId) return 1;
+
+    const byLabel = left.label.localeCompare(right.label, undefined, { sensitivity: "base", numeric: true });
+    if (byLabel !== 0) {
+      return byLabel;
+    }
+
+    return left.createdAt.localeCompare(right.createdAt);
+  });
+}
+
 const COPY = {
   "en-US": {
-    appName: "Codex Auth",
+    appName: "Codex Auth Manager",
     bridgeTitle: "Desktop bridge failed",
     bridgeBody: "The Electron bridge is unavailable. Restart the app.",
     loading: "Loading accounts...",
@@ -221,8 +242,6 @@ const COPY = {
     export: "Export",
     settings: "Settings",
     theme: "Theme",
-    polling: "Polling",
-    minutes: "min",
     dark: "Dark",
     light: "Light",
     authPath: "Auth path",
@@ -240,7 +259,6 @@ const COPY = {
     trend: "Trend",
     save: "Save",
     useForOpenCode: "Switch",
-    replaceFromLive: "Replace from Live",
     delete: "Delete",
     accountUsageHistory: "{name} history",
     aggregateHistory: "{name} aggregate history",
@@ -250,7 +268,7 @@ const COPY = {
     low: "Low"
   },
   "zh-CN": {
-    appName: "Codex Auth",
+    appName: "Codex Auth Manager",
     bridgeTitle: "桌面桥接失败",
     bridgeBody: "无法与桌面后端通信。请重启应用。",
     loading: "加载中...",
@@ -261,8 +279,6 @@ const COPY = {
     export: "导出",
     settings: "设置",
     theme: "主题",
-    polling: "查询频率",
-    minutes: "min",
     dark: "深色",
     light: "浅色",
     authPath: "Auth 路径",
@@ -280,7 +296,6 @@ const COPY = {
     trend: "趋势",
     save: "保存",
     useForOpenCode: "切换",
-    replaceFromLive: "用当前覆盖",
     delete: "删除",
     accountUsageHistory: "{name} 用量历史",
     aggregateHistory: "{name} 总体历史",
@@ -443,70 +458,6 @@ function getDisplayedStatus(account: ManagedAccount, key: QuotaWindowKey): Quota
     return "warning";
   }
   return "ok";
-}
-
-function parseIsoTime(value: string | null | undefined) {
-  if (!value) {
-    return null;
-  }
-
-  const timeMs = new Date(value).getTime();
-  return Number.isFinite(timeMs) ? timeMs : null;
-}
-
-function getAccountNormalRefreshIntervalMs(account: ManagedAccount) {
-  const usableValues = QUOTA_KEYS
-    .map((key) => getDisplayedRemainingPercent(account, key))
-    .filter((value): value is number => value !== null && value !== undefined && value > 0);
-
-  if (usableValues.length === 0) {
-    return null;
-  }
-
-  const lowestPercent = Math.min(...usableValues);
-  const minutes = Math.max(1, Math.min(10, Math.ceil(lowestPercent / 10)));
-  return minutes * 60 * 1000;
-}
-
-function getAccountResetCandidates(account: ManagedAccount) {
-  const candidates: number[] = [];
-  for (const quotaKey of QUOTA_KEYS) {
-    const timeMs = parseIsoTime(getWindow(account, quotaKey)?.resetAt ?? null);
-    if (timeMs !== null) {
-      candidates.push(timeMs);
-    }
-  }
-
-  return [...new Set(candidates)].sort((left, right) => left - right);
-}
-
-function getAccountNextRefreshAt(account: ManagedAccount, isActiveAccount: boolean, nowMs: number) {
-  const lastKnownAt = parseIsoTime(account.lastQuota?.fetchedAt ?? account.updatedAt ?? account.createdAt) ?? nowMs;
-  const dynamicIntervalMs = getAccountNormalRefreshIntervalMs(account);
-  const nextResetAt = getAccountResetCandidates(account)[0] ?? null;
-  const candidates: number[] = [];
-
-  if (isActiveAccount && dynamicIntervalMs !== null) {
-    candidates.push(lastKnownAt + dynamicIntervalMs);
-  }
-
-  if (nextResetAt !== null) {
-    candidates.push(Math.max(nextResetAt, nowMs));
-  }
-
-  if (candidates.length > 0) {
-    return Math.min(...candidates);
-  }
-
-  if (isActiveAccount) {
-    return nowMs + 5 * 60 * 1000;
-  }
-
-  if (!account.lastQuota || account.lastError) {
-    return nowMs + 30 * 60 * 1000;
-  }
-
-  return null;
 }
 
 function getCreditsLabel(account: ManagedAccount, locale: Locale, unitLabel: string) {
@@ -772,24 +723,42 @@ function useDashboardState() {
   const [pendingCount, setPendingCount] = useState(0);
   const [message, setMessage] = useState<string | null>(null);
   const mountedRef = useRef(true);
+  const latestRevisionRef = useRef(state.revision);
 
   const applyState = useCallback((next: DashboardState) => {
-    setState((current) => next.revision < current.revision ? current : next);
+    if (next.revision < latestRevisionRef.current) {
+      return false;
+    }
+
+    latestRevisionRef.current = next.revision;
+    setState(next);
+    return true;
   }, []);
+
+  useEffect(() => {
+    latestRevisionRef.current = state.revision;
+  }, [state.revision]);
 
   useEffect(() => {
     mountedRef.current = true;
 
     void window.opencodeCodexAuth?.getState().then((next) => {
-      if (mountedRef.current) {
-        applyState(next as DashboardState);
+      if (mountedRef.current && isDashboardState(next)) {
+        applyState(next);
       }
     }).catch(() => {
       // keep the immediate empty dashboard state
     });
 
+    const unsubscribe = window.opencodeCodexAuth?.onStateChanged?.((next) => {
+      if (mountedRef.current && isDashboardState(next)) {
+        applyState(next);
+      }
+    });
+
     return () => {
       mountedRef.current = false;
+      unsubscribe?.();
     };
   }, []);
 
@@ -1021,7 +990,9 @@ function CombinedChart(props: { series: Record<QuotaWindowKey, SeriesPoint[]>; l
     const observer = new ResizeObserver(() => updateWidth());
     observer.observe(plotRef.current);
 
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+    };
   }, []);
 
   useEffect(() => {
@@ -1172,24 +1143,35 @@ export default function App() {
   const [authClosing, setAuthClosing] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [toastVisible, setToastVisible] = useState(false);
+  const [importSpotlight, setImportSpotlight] = useState<{ accountIds: string[]; token: number } | null>(null);
+  const [pendingOverviewImportReplayAccountIds, setPendingOverviewImportReplayAccountIds] = useState<string[]>([]);
+  const [quotaAnimationTick, setQuotaAnimationTick] = useState(0);
   const getAuthRef = useRef<HTMLDivElement | null>(null);
   const settingsRef = useRef<HTMLDivElement | null>(null);
   const fileImportInputRef = useRef<HTMLInputElement | null>(null);
   const chipRailRef = useRef<HTMLElement | null>(null);
   const getAuthCloseTimerRef = useRef<number | null>(null);
   const settingsCloseTimerRef = useRef<number | null>(null);
-  const accountRefreshTimeoutsRef = useRef<Record<string, number>>({});
-  const accountRefreshInFlightRef = useRef<Record<string, boolean>>({});
+  const importSpotlightTimerRef = useRef<number | null>(null);
+  const importVisibleAccountIdsRef = useRef<Set<string>>(new Set());
+  const importSpotlightTokenRef = useRef(0);
   const [chipRailHeight, setChipRailHeight] = useState(0);
   const currentMode = state.settings.currentMode;
   const currentModeAuthPath = currentMode === "codex" ? state.settings.codexAuthPath : state.settings.opencodeAuthPath;
   const currentModeActiveAccountId = currentMode === "codex" ? state.activeCodexAccountId : state.activeOpenCodeAccountId;
+  const orderedAccounts = useMemo(
+    () => sortVisibleAccounts(state.accounts, currentModeActiveAccountId),
+    [state.accounts, currentModeActiveAccountId]
+  );
+  const invalidAccountIds = useMemo(
+    () => new Set(state.accounts.filter(isInvalidAccount).map((account) => account.id)),
+    [state.accounts]
+  );
+  const actionLocked = busy || runningAuthAction !== null || runningToolbarAction !== null;
 
   useEffect(() => {
-    if (state) {
-      setPathDraft(currentModeAuthPath);
-    }
-  }, [currentModeAuthPath, state]);
+    setPathDraft(currentModeAuthPath);
+  }, [currentModeAuthPath]);
 
   useEffect(() => {
     const rail = chipRailRef.current;
@@ -1259,21 +1241,28 @@ export default function App() {
       if (settingsCloseTimerRef.current !== null) {
         window.clearTimeout(settingsCloseTimerRef.current);
       }
-      Object.values(accountRefreshTimeoutsRef.current).forEach((handle) => window.clearTimeout(handle));
+      if (importSpotlightTimerRef.current !== null) {
+        window.clearTimeout(importSpotlightTimerRef.current);
+      }
     };
   }, []);
 
   const text = COPY[locale];
   const meta = quotaMeta(locale);
-  const aggregateBars = useMemo(() => computeAggregateBars(state.accounts, locale, focus), [state.accounts, locale, focus]);
+  const aggregateBars = useMemo(() => computeAggregateBars(orderedAccounts, locale, focus), [orderedAccounts, locale, focus]);
 
   const focusAccount =
-    state.accounts.find((account) =>
+    orderedAccounts.find((account) =>
       focus.kind === "account" ? account.id === focus.accountId : hoveredAccountId ? account.id === hoveredAccountId : false
     ) ?? null;
-  const selectedAccount = focus.kind === "account" ? state.accounts.find((account) => account.id === focus.accountId) ?? null : null;
-  const activeVisualAccountId = focus.kind === "account" ? focus.accountId : hoveredAccountId;
-  const activeMarkerAccountId = focus.kind === "account" ? focus.accountId : hoveredAccountId;
+  const selectedAccount = focus.kind === "account" ? orderedAccounts.find((account) => account.id === focus.accountId) ?? null : null;
+  const spotlightAccountIds = useMemo(
+    () => new Set(importSpotlight?.accountIds ?? []),
+    [importSpotlight]
+  );
+  const singleSpotlightAccountId = importSpotlight?.accountIds.length === 1 ? importSpotlight.accountIds[0] : null;
+  const activeVisualAccountId = focus.kind === "account" ? focus.accountId : hoveredAccountId ?? singleSpotlightAccountId;
+  const activeMarkerAccountId = focus.kind === "account" ? focus.accountId : hoveredAccountId ?? singleSpotlightAccountId;
 
   useEffect(() => {
     if (focus.kind === "account" && !state.accounts.some((account) => account.id === focus.accountId)) {
@@ -1282,63 +1271,62 @@ export default function App() {
     }
   }, [focus, state.accounts]);
 
-  useEffect(() => {
-    if (!window.opencodeCodexAuth || !currentModeAuthPath) {
-      return;
-    }
-
-    Object.values(accountRefreshTimeoutsRef.current).forEach((handle) => window.clearTimeout(handle));
-    accountRefreshTimeoutsRef.current = {};
-
-    for (const account of state.accounts) {
-      const nextRefreshAt = getAccountNextRefreshAt(account, currentModeActiveAccountId === account.id, Date.now());
-      if (nextRefreshAt === null) {
-        continue;
-      }
-      const delayMs = Math.max(0, nextRefreshAt - Date.now());
-
-      accountRefreshTimeoutsRef.current[account.id] = window.setTimeout(() => {
-        if (accountRefreshInFlightRef.current[account.id]) {
-          return;
-        }
-
-        accountRefreshInFlightRef.current[account.id] = true;
-        void run(() => window.opencodeCodexAuth.refreshAccount(account.id), (next) => {
-          if (next && isDashboardState(next)) {
-            applyState(next);
-          }
-        }, { trackBusy: false, clearMessage: false }).finally(() => {
-          delete accountRefreshInFlightRef.current[account.id];
-        });
-      }, delayMs);
-    }
-
-    return () => {
-      Object.values(accountRefreshTimeoutsRef.current).forEach((handle) => window.clearTimeout(handle));
-      accountRefreshTimeoutsRef.current = {};
-    };
-  }, [applyState, currentModeActiveAccountId, currentModeAuthPath, run, state.accounts]);
-
   const chartSeries = useMemo(() => {
     if (!state || focus.kind === "overview") {
       return null;
     }
-    return buildSeries(state.history, state.accounts, focus.kind === "account" ? focus : { kind: "aggregate", quotaKey: focus.quotaKey });
-  }, [focus, state]);
+    return buildSeries(state.history, orderedAccounts, focus.kind === "account" ? focus : { kind: "aggregate", quotaKey: focus.quotaKey });
+  }, [focus, orderedAccounts, state.history]);
 
   function handleShellClick(event: ReactMouseEvent<HTMLDivElement>) {
-    if (focus.kind !== "account") return;
+    if (focus.kind === "overview") return;
     const target = event.target as HTMLElement;
     if (target.closest("button,input,textarea,select,label,a,[role='button'],[data-preserve-focus='true']")) {
       return;
     }
-    setFocus({ kind: "overview" });
-    setHoveredAccountId(null);
+    returnToOverview({ replayImportedAccount: true });
   }
 
   function dismissMessage() {
     setToastVisible(false);
     window.setTimeout(() => setMessage(null), 180);
+  }
+
+  function replayQuotaAnimation() {
+    setQuotaAnimationTick((tick) => tick + 1);
+  }
+
+  function triggerImportSpotlight(accountIds: string[]) {
+    if (accountIds.length === 0) {
+      return;
+    }
+
+    const token = importSpotlightTokenRef.current + 1;
+    importSpotlightTokenRef.current = token;
+    setImportSpotlight({ accountIds, token });
+    if (importSpotlightTimerRef.current !== null) {
+      window.clearTimeout(importSpotlightTimerRef.current);
+    }
+    importSpotlightTimerRef.current = window.setTimeout(() => {
+      setImportSpotlight((current) => current?.token === token ? null : current);
+      importSpotlightTimerRef.current = null;
+    }, IMPORT_SPOTLIGHT_DURATION_MS);
+  }
+
+  function returnToOverview(options?: { replayImportedAccount?: boolean }) {
+    const shouldReplayImportedAccounts = options?.replayImportedAccount
+      && focus.kind === "account"
+      && pendingOverviewImportReplayAccountIds.includes(focus.accountId);
+
+    setFocus({ kind: "overview" });
+    setHoveredAccountId(null);
+
+    if (shouldReplayImportedAccounts) {
+      replayQuotaAnimation();
+      triggerImportSpotlight(pendingOverviewImportReplayAccountIds);
+    }
+
+    setPendingOverviewImportReplayAccountIds([]);
   }
 
   function applyAuthPreviewAction(action: AuthPreviewAction) {
@@ -1355,6 +1343,9 @@ export default function App() {
   }
 
   async function runAuthAction<T>(action: RunningAuthAction, task: () => Promise<T>, onSuccess?: (result: T) => void) {
+    if (actionLocked) {
+      return undefined;
+    }
     setRunningAuthAction(action);
     setGetAuthOpen(true);
     try {
@@ -1365,6 +1356,9 @@ export default function App() {
   }
 
   async function runToolbarAction<T>(action: ToolbarMotionAction, task: () => Promise<T>, onSuccess?: (result: T) => void) {
+    if (actionLocked) {
+      return undefined;
+    }
     setRunningToolbarAction(action);
     try {
       return await run(task, onSuccess);
@@ -1374,6 +1368,9 @@ export default function App() {
   }
 
   function openGetAuthMenu() {
+    if (actionLocked) {
+      return;
+    }
     if (getAuthCloseTimerRef.current !== null) {
       window.clearTimeout(getAuthCloseTimerRef.current);
       getAuthCloseTimerRef.current = null;
@@ -1424,6 +1421,9 @@ export default function App() {
   }
 
   function openSettingsMenu() {
+    if (actionLocked) {
+      return;
+    }
     if (settingsCloseTimerRef.current !== null) {
       window.clearTimeout(settingsCloseTimerRef.current);
       settingsCloseTimerRef.current = null;
@@ -1446,14 +1446,47 @@ export default function App() {
       return;
     }
 
-    applyState(result.state);
-    if (result.importedAccountId) {
-      setHoveredAccountId(null);
-      setFocus({ kind: "account", accountId: result.importedAccountId, quotaKey: "fiveHour" });
+    if (!applyState(result.state)) {
+      return;
     }
-    const notices = Array.isArray(result.notices) ? result.notices : [];
+
     const importedCount = Array.isArray(result.importedAccountIds) ? result.importedAccountIds.length : 0;
-    if (importedCount > 1) {
+    const visibleImportedAccountIds = Array.isArray(result.importedAccountIds)
+      ? result.importedAccountIds.filter((accountId) => result.state.accounts.some((account) => account.id === accountId))
+      : [];
+    const newlyVisibleImportedAccountIds = visibleImportedAccountIds.filter((accountId) => !importVisibleAccountIdsRef.current.has(accountId));
+    const importedAccountVisible = !!result.importedAccountId
+      && result.state.accounts.some((account) => account.id === result.importedAccountId);
+    const matchedExistingVisible = importedCount === 1
+      && !!result.importedAccountId
+      && importVisibleAccountIdsRef.current.has(result.importedAccountId);
+    const hiddenOpenCodeImportInCodex = currentMode === "codex"
+      && importedCount === 1
+      && !!result.importedAccountId
+      && !matchedExistingVisible
+      && !importedAccountVisible;
+
+    if (result.importedAccountId && importedAccountVisible) {
+      setHoveredAccountId(null);
+      if (matchedExistingVisible) {
+        setFocus({ kind: "overview" });
+        triggerImportSpotlight([result.importedAccountId]);
+        setPendingOverviewImportReplayAccountIds([]);
+      } else {
+        setImportSpotlight(null);
+        setPendingOverviewImportReplayAccountIds(newlyVisibleImportedAccountIds.length > 0 ? newlyVisibleImportedAccountIds : [result.importedAccountId]);
+        setFocus({ kind: "account", accountId: result.importedAccountId, quotaKey: "fiveHour" });
+      }
+    } else {
+      setPendingOverviewImportReplayAccountIds([]);
+    }
+
+    const notices = Array.isArray(result.notices) ? result.notices : [];
+    if (matchedExistingVisible) {
+      notices.unshift(locale === "zh-CN" ? "已匹配当前模式中的已有账号，并已更新该账号。" : "Matched an existing account in the current mode and updated it.");
+    } else if (hiddenOpenCodeImportInCodex) {
+      notices.unshift(locale === "zh-CN" ? "已导入 OpenCode 格式授权，请切换到 OpenCode 模式查看。" : "Imported an OpenCode-format auth. Switch to OpenCode mode to view it.");
+    } else if (importedCount > 1) {
       notices.unshift(locale === "zh-CN" ? `已导入 ${importedCount} 个账号` : `Imported ${importedCount} accounts`);
     } else if (importedCount === 1) {
       notices.unshift(locale === "zh-CN" ? "导入成功" : "Import succeeded");
@@ -1480,21 +1513,28 @@ export default function App() {
       return;
     }
 
-    applyState(result);
+    if (!applyState(result)) {
+      return;
+    }
+
     afterApply?.();
     setMessage(successMessage);
   }
 
   function handleModeSwitch(nextMode: AuthMode) {
-    if (nextMode === currentMode) {
+    if (actionLocked || nextMode === currentMode) {
       return;
     }
 
     void run(
       () => window.opencodeCodexAuth.updateSettings({ currentMode: nextMode }),
       (result) => {
-        if (isDashboardState(result)) {
-          applyState(result);
+        if (isDashboardState(result) && applyState(result)) {
+          replayQuotaAnimation();
+          setFocus({ kind: "overview" });
+          setHoveredAccountId(null);
+          setImportSpotlight(null);
+          setPendingOverviewImportReplayAccountIds([]);
         }
       },
       { clearMessage: false }
@@ -1519,6 +1559,8 @@ export default function App() {
       raw: await file.text()
     })));
 
+    importVisibleAccountIdsRef.current = new Set(state.accounts.map((account) => account.id));
+
     await runAuthAction(
       "import",
       () => window.opencodeCodexAuth.importFilePayloads(payloads),
@@ -1526,11 +1568,21 @@ export default function App() {
     );
   }
 
+  const titleModes: AuthMode[] = currentMode === "opencode"
+    ? ["opencode", "codex"]
+    : ["codex", "opencode"];
+
+  const titleModeLabels: Record<AuthMode, string> = {
+    opencode: "OpenCode",
+    codex: "Codex"
+  };
+
   return (
     <div className="app-shell" onClick={handleShellClick}>
       <input
         ref={fileImportInputRef}
         type="file"
+        disabled={actionLocked}
         accept=".json,application/json"
         multiple
         style={{ display: "none" }}
@@ -1538,9 +1590,9 @@ export default function App() {
       />
       <header className="main-header">
         <h1 className="app-title app-title-mode" data-preserve-focus="true">
-          <button className={`app-title-mode-button${currentMode === "opencode" ? " is-active" : ""}`} onClick={() => handleModeSwitch("opencode")}>OpenCode</button>
-          <span className="app-title-mode-separator">/</span>
-          <button className={`app-title-mode-button${currentMode === "codex" ? " is-active" : ""}`} onClick={() => handleModeSwitch("codex")}>Codex</button>
+          <button type="button" disabled={actionLocked} className={`app-title-mode-button${currentMode === titleModes[0] ? " is-active" : ""}`} onClick={() => handleModeSwitch(titleModes[0])}>{titleModeLabels[titleModes[0]]}</button>
+          <span className="app-title-mode-separator">·</span>
+          <button type="button" disabled={actionLocked} className={`app-title-mode-button${currentMode === titleModes[1] ? " is-active" : ""}`} onClick={() => handleModeSwitch(titleModes[1])}>{titleModeLabels[titleModes[1]]}</button>
           <span className="app-title-mode-suffix">Auth</span>
         </h1>
         <div className="header-actions">
@@ -1552,7 +1604,7 @@ export default function App() {
             onPointerLeave={handleGetAuthPointerLeave}
             onBlur={handleGetAuthBlur}
           >
-            <button className={`expandable-button auth-toolbar-button${getAuthOpen ? " is-open" : ""}${authClosing ? " is-closing" : ""}${runningAuthAction ? ` is-running-auth is-auth-${runningAuthAction}` : ""}`} title={text.getAuth} aria-label={text.getAuth} onClick={() => { setAuthClosing(false); setGetAuthOpen((open) => !open); }}>
+            <button disabled={actionLocked} className={`expandable-button auth-toolbar-button${getAuthOpen ? " is-open" : ""}${authClosing ? " is-closing" : ""}${runningAuthAction ? ` is-running-auth is-auth-${runningAuthAction}` : ""}`} title={text.getAuth} aria-label={text.getAuth} onClick={() => { if (actionLocked) return; setAuthClosing(false); setGetAuthOpen((open) => !open); }}>
               <span key={`auth-${authPreviewIcon}-${authIconMotionTick}`} className={`toolbar-leading-icon toolbar-leading-icon-auth${authMotionDirection === "down" ? " is-roll-down" : authMotionDirection === "up" ? " is-roll-up" : ""}`}>
                 <AuthButtonIcon icon={authPreviewIcon} />
               </span>
@@ -1561,54 +1613,58 @@ export default function App() {
             </button>
             {getAuthOpen && (
               <div className="dropdown-menu" onMouseEnter={openGetAuthMenu} onMouseLeave={handleGetAuthPointerLeave} onPointerLeave={handleGetAuthPointerLeave}>
-                  <button onMouseEnter={() => applyAuthPreviewAction("login")} onFocus={() => applyAuthPreviewAction("login")} onClick={() => { void runAuthAction("login", () => window.opencodeCodexAuth.loginImportAccount(), (r) => handleImportResult(r as ImportResult | null)); }}>
-                    {text.loginImport}
+                  <button disabled={actionLocked} aria-label={text.loginImport} onMouseEnter={() => applyAuthPreviewAction("login")} onFocus={() => applyAuthPreviewAction("login")} onClick={() => { importVisibleAccountIdsRef.current = new Set(orderedAccounts.map((account) => account.id)); void runAuthAction("login", () => window.opencodeCodexAuth.loginImportAccount(), (r) => handleImportResult(r as ImportResult | null)); }}>
+                    <span className="dropdown-button-icon"><IconKey /></span>
+                    <span className="dropdown-button-label">{text.loginImport}</span>
                 </button>
-                  <button onMouseEnter={() => applyAuthPreviewAction("import")} onFocus={() => applyAuthPreviewAction("import")} onClick={() => { setRunningAuthAction("import"); setGetAuthOpen(true); fileImportInputRef.current?.click(); }}>
-                    {text.importFile}
+                  <button disabled={actionLocked} aria-label={text.importFile} onMouseEnter={() => applyAuthPreviewAction("import")} onFocus={() => applyAuthPreviewAction("import")} onClick={() => { if (actionLocked) return; setGetAuthOpen(true); fileImportInputRef.current?.click(); }}>
+                    <span className="dropdown-button-icon"><IconDownload /></span>
+                    <span className="dropdown-button-label">{text.importFile}</span>
                 </button>
                 <div className="dropdown-divider" />
-                <button disabled={state.accounts.length === 0} onMouseEnter={() => applyAuthPreviewAction("export")} onFocus={() => applyAuthPreviewAction("export")} onClick={() => { void runAuthAction("export", () => window.opencodeCodexAuth.exportAccount(selectedAccount ? [selectedAccount.id] : state.accounts.map((account) => account.id)), (r) => handleExportResult(r as ExportResult | null)); }}>
-                    {text.export}
+                <button aria-label={text.export} disabled={actionLocked || orderedAccounts.length === 0} onMouseEnter={() => applyAuthPreviewAction("export")} onFocus={() => applyAuthPreviewAction("export")} onClick={() => { void runAuthAction("export", () => window.opencodeCodexAuth.exportAccount(selectedAccount ? [selectedAccount.id] : orderedAccounts.map((account) => account.id)), (r) => handleExportResult(r as ExportResult | null)); }}>
+                    <span className="dropdown-button-icon"><IconUpload /></span>
+                    <span className="dropdown-button-label">{text.export}</span>
                 </button>
-                <button className="is-danger" disabled={busy || !selectedAccount} onMouseEnter={() => applyAuthPreviewAction("delete")} onFocus={() => applyAuthPreviewAction("delete")} onClick={() => { if (!selectedAccount) return; void runAuthAction("delete", () => window.opencodeCodexAuth.deleteAccount(selectedAccount.id), (r) => handleStateResult(r, locale === "zh-CN" ? `已删除账号：${selectedAccount.label}` : `Deleted account: ${selectedAccount.label}`, () => { setFocus({ kind: "overview" }); setHoveredAccountId(null); })); }}>
-                    {text.delete}
+                <button aria-label={text.delete} className="is-danger" disabled={actionLocked || !selectedAccount} onMouseEnter={() => applyAuthPreviewAction("delete")} onFocus={() => applyAuthPreviewAction("delete")} onClick={() => { if (!selectedAccount) return; void runAuthAction("delete", () => window.opencodeCodexAuth.deleteAccount(selectedAccount.id), (r) => handleStateResult(r, locale === "zh-CN" ? `已删除账号：${selectedAccount.label}` : `Deleted account: ${selectedAccount.label}`, () => { setFocus({ kind: "overview" }); setHoveredAccountId(null); })); }}>
+                    <span className="dropdown-button-icon"><IconTrash /></span>
+                    <span className="dropdown-button-label">{text.delete}</span>
                 </button>
               </div>
             )}
           </div>
-          <button className={`expandable-button toolbar-button${runningToolbarAction === "refresh" ? " is-running-refresh" : ""}`} title={text.refresh} aria-label={text.refresh} onClick={() => { void runToolbarAction("refresh", () => selectedAccount ? window.opencodeCodexAuth.refreshAccount(selectedAccount.id) : window.opencodeCodexAuth.refreshAll(), (r) => handleStateResult(r, locale === "zh-CN" ? (selectedAccount ? `已刷新账号：${selectedAccount.label}` : "已刷新全部账号") : (selectedAccount ? `Refreshed account: ${selectedAccount.label}` : "Refreshed all accounts"))); }}>
+          <button disabled={actionLocked} className={`expandable-button toolbar-button${runningToolbarAction === "refresh" ? " is-running-refresh" : ""}`} title={text.refresh} aria-label={text.refresh} onClick={() => { void runToolbarAction("refresh", () => selectedAccount ? window.opencodeCodexAuth.refreshAccount(selectedAccount.id) : window.opencodeCodexAuth.refreshAll(), (r) => handleStateResult(r, locale === "zh-CN" ? (selectedAccount ? `已刷新账号：${selectedAccount.label}` : "已刷新全部账号") : (selectedAccount ? `Refreshed account: ${selectedAccount.label}` : "Refreshed all accounts"))); }}>
             <span className="toolbar-leading-icon toolbar-leading-icon-refresh"><IconRefresh /></span>
             <span className="button-text">{text.refresh}</span>
           </button>
-          <button className={`expandable-button toolbar-button${runningToolbarAction === "switch" ? " is-running-switch" : ""}`} title={text.useForOpenCode} aria-label={text.useForOpenCode} disabled={busy || !selectedAccount} onClick={() => { if (!selectedAccount) return; void runToolbarAction("switch", () => window.opencodeCodexAuth.activateAccount(selectedAccount.id), (r) => handleStateResult(r, locale === "zh-CN" ? `已切换当前使用：${selectedAccount.label}` : `Switched active account: ${selectedAccount.label}`)); }}>
+          <button className={`expandable-button toolbar-button${runningToolbarAction === "switch" ? " is-running-switch" : ""}`} title={text.useForOpenCode} aria-label={text.useForOpenCode} disabled={actionLocked || !selectedAccount} onClick={() => { if (!selectedAccount) return; void runToolbarAction("switch", () => window.opencodeCodexAuth.activateAccount(selectedAccount.id), (r) => handleStateResult(r, locale === "zh-CN" ? `已切换当前使用：${selectedAccount.label}` : `Switched active account: ${selectedAccount.label}`, replayQuotaAnimation)); }}>
             <span className="toolbar-leading-icon toolbar-leading-icon-switch"><IconLink /></span>
             <span className="button-text">{text.useForOpenCode}</span>
           </button>
           <div ref={settingsRef} className="settings-container toolbar-utility" onMouseEnter={openSettingsMenu} onMouseLeave={closeSettingsMenuSoon}>
-            <button className={`icon-button ${settingsOpen ? 'is-active' : ''}`} onClick={() => setSettingsOpen((open) => !open)}>
+            <button disabled={actionLocked} className={`icon-button ${settingsOpen ? 'is-active' : ''}`} onClick={() => { if (actionLocked) return; setSettingsOpen((open) => !open); }}>
               <IconSettings />
             </button>
             {settingsOpen && (
               <div className="settings-popover surface-card" onMouseEnter={openSettingsMenu} onMouseLeave={closeSettingsMenuSoon}>
                 <div className="settings-row">
                   <span className="settings-label">{text.language}</span>
-                  <button className="ghost-button compact-button settings-inline-button" onClick={() => setLocale(c => c === "en-US" ? "zh-CN" : "en-US")}> 
+                  <button disabled={actionLocked} className="ghost-button compact-button settings-inline-button" onClick={() => setLocale(c => c === "en-US" ? "zh-CN" : "en-US")}> 
                     {locale === "en-US" ? "zh-CN" : "en-US"}
                   </button>
                 </div>
                 <div className="settings-row">
                   <span className="settings-label">{text.theme}</span>
-                  <button className="ghost-button compact-button settings-inline-button" onClick={() => setTheme((current) => current === "light" ? "dark" : "light")}> 
+                  <button disabled={actionLocked} className="ghost-button compact-button settings-inline-button" onClick={() => setTheme((current) => current === "light" ? "dark" : "light")}> 
                     {theme === "light" ? text.dark : text.light}
                   </button>
                 </div>
                 <div className="settings-row">
                   <span className="settings-label">{text.authPath}</span>
                   <div className="auth-path-inputs">
-                    <input className="compact-input" value={pathDraft} onChange={(e) => setPathDraft(e.target.value)} />
-                    <button className="ghost-button compact-button" onClick={() => run(() => window.opencodeCodexAuth.pickAuthPath(), (n) => n && handleStateResult(n, locale === "zh-CN" ? "已更新 Auth 路径" : "Auth path updated"))}>{text.browse}</button>
-                    <button className="ghost-button compact-button" onClick={() => run(() => window.opencodeCodexAuth.updateSettings(currentMode === "codex" ? { codexAuthPath: pathDraft } : { opencodeAuthPath: pathDraft }), (r) => handleStateResult(r, locale === "zh-CN" ? "已保存 Auth 路径" : "Auth path saved"))}>{text.save}</button>
+                    <input disabled={actionLocked} className="compact-input" value={pathDraft} onChange={(e) => setPathDraft(e.target.value)} />
+                    <button disabled={actionLocked} className="ghost-button compact-button" onClick={() => run(() => window.opencodeCodexAuth.pickAuthPath(), (n) => n && handleStateResult(n, locale === "zh-CN" ? "已更新 Auth 路径" : "Auth path updated"))}>{text.browse}</button>
+                    <button disabled={actionLocked} className="ghost-button compact-button" onClick={() => run(() => window.opencodeCodexAuth.updateSettings(currentMode === "codex" ? { codexAuthPath: pathDraft } : { opencodeAuthPath: pathDraft }), (r) => handleStateResult(r, locale === "zh-CN" ? "已保存 Auth 路径" : "Auth path saved"))}>{text.save}</button>
                   </div>
                 </div>
               </div>
@@ -1618,9 +1674,9 @@ export default function App() {
       </header>
 
       <main className={`main-stage${accountsCollapsed ? " is-accounts-collapsed" : ""}${focus.kind !== "overview" ? " is-focus-open" : ""}${accountsCollapsed && focus.kind === "overview" ? " is-overview-centered" : ""}`}>
-        <section className="unified-quota-card surface-card">
+        <section className="unified-quota-card">
           {aggregateBars.map((bar) => (
-            <div className="quota-row" key={bar.quotaKey}>
+            <div className="quota-row" key={`${bar.quotaKey}-${quotaAnimationTick}`}>
               {(() => {
                 const visibleStateMarkers = bar.stateMarkers;
                 const visibleSegments = bar.segments;
@@ -1647,14 +1703,16 @@ export default function App() {
                       const dimmed = activeVisualAccountId && activeVisualAccountId !== seg.accountId;
                       const focused = focus.kind === "account" && focus.accountId === seg.accountId;
                       const active = currentModeActiveAccountId === seg.accountId;
+                      const invalid = invalidAccountIds.has(seg.accountId);
+                      const spotlighted = spotlightAccountIds.has(seg.accountId);
                       const segmentIndex = renderedSegments.findIndex((segment) => segment.accountId === seg.accountId);
                       const isFirstVisible = segmentIndex === 0;
                       const isLastVisible = segmentIndex === renderedSegments.length - 1;
                       return (
                         <div
-                          key={seg.accountId}
-                          className={`quota-segment${dimmed ? " is-dimmed" : ""}${focused ? " is-focused" : ""}${active ? " is-active-account" : ""}${isFirstVisible && !hasVisibleLeadingMarker ? " is-round-start" : ""}${isLastVisible && !hasVisibleTrailingMarker ? " is-round-end" : ""}${seg.isHiddenByFocus ? " is-hidden-focus" : ""}`}
-                          style={{ width: `${seg.widthPercent}%`, backgroundColor: seg.color }}
+                          key={`${seg.accountId}-${spotlighted ? importSpotlight?.token ?? 0 : "steady"}`}
+                          className={`quota-segment${dimmed ? " is-dimmed" : ""}${focused ? " is-focused" : ""}${active ? " is-active-account" : ""}${invalid ? " is-invalid" : ""}${isFirstVisible && !hasVisibleLeadingMarker ? " is-round-start" : ""}${isLastVisible && !hasVisibleTrailingMarker ? " is-round-end" : ""}${seg.isHiddenByFocus ? " is-hidden-focus" : ""}`}
+                          style={{ width: `${seg.widthPercent}%`, backgroundColor: seg.color, "--segment-delay": `${Math.max(0, segmentIndex) * 80}ms` } as CSSProperties & Record<"--segment-delay", string>}
                           onMouseEnter={() => setHoveredAccountId(seg.accountId)}
                           onClick={(e) => { e.stopPropagation(); setHoveredAccountId(null); setFocus({ kind: "account", accountId: seg.accountId, quotaKey: bar.quotaKey }); }}
                         >
@@ -1703,8 +1761,8 @@ export default function App() {
                   <div className="quota-track-states">
                     {visibleStateMarkers.map((marker) => (
                         <div
-                          key={`${marker.accountId}-${marker.status}`}
-                          className={`state-region is-${marker.status} is-${marker.anchor}${activeMarkerIdForBar === marker.accountId ? " is-active" : ""}${activeVisualAccountId && activeVisualAccountId !== marker.accountId ? " is-dimmed" : ""}${marker.isHiddenByFocus ? " is-hidden-focus" : ""}`}
+                          key={`${marker.accountId}-${marker.status}-${spotlightAccountIds.has(marker.accountId) ? importSpotlight?.token ?? 0 : "steady"}`}
+                          className={`state-region is-${marker.status} is-${marker.anchor}${activeMarkerIdForBar === marker.accountId ? " is-active" : ""}${activeVisualAccountId && activeVisualAccountId !== marker.accountId ? " is-dimmed" : ""}${invalidAccountIds.has(marker.accountId) ? " is-invalid" : ""}${spotlightAccountIds.has(marker.accountId) ? " is-import-spotlight" : ""}${marker.isHiddenByFocus ? " is-hidden-focus" : ""}`}
                           style={{ left: `${marker.leftPercent}%`, color: marker.color, transform: marker.anchor === "start" ? "translateX(0)" : marker.anchor === "end" ? "translateX(-100%)" : "translateX(-50%)" }}
                           title={`${marker.label} - ${marker.status === "empty" ? text.empty : text.unknown}`}
                         onMouseEnter={() => setHoveredAccountId(marker.accountId)}
@@ -1742,20 +1800,22 @@ export default function App() {
 
         <div className={`chip-rail-shell${accountsCollapsed ? " is-collapsed" : ""}`} style={{ maxHeight: accountsCollapsed ? "0px" : `${chipRailHeight}px` } as CSSProperties}>
           <section ref={chipRailRef} className="chip-rail">
-          {state.accounts.map((account) => {
+          {orderedAccounts.map((account) => {
             const active = currentModeActiveAccountId === account.id;
             const highlighted = hoveredAccountId === account.id || (focus.kind === "account" && focus.accountId === account.id);
+            const invalid = isInvalidAccount(account);
+            const spotlighted = spotlightAccountIds.has(account.id);
             const creditsLabel = getCreditsLabel(account, locale, text.creditsLabel);
             return (
               <button
-                key={account.id}
+                key={`${account.id}-${spotlighted ? importSpotlight?.token ?? 0 : "steady"}`}
                 data-preserve-focus="true"
-                className={`chip${highlighted ? " is-selected" : ""}`}
+                className={`chip${highlighted ? " is-selected" : ""}${invalid ? " is-invalid" : ""}${spotlighted ? " is-import-spotlight" : ""}`}
                 onMouseEnter={() => setHoveredAccountId(account.id)}
                 onMouseLeave={() => setHoveredAccountId(null)}
                 onClick={() => { setHoveredAccountId(null); setFocus({ kind: "account", accountId: account.id, quotaKey: focus.kind === "account" ? focus.quotaKey : "fiveHour" }); }}
               >
-                <span className="chip-dot" style={{ background: getAccountColor(account, state.accounts) }} />
+                <span className="chip-dot" style={{ background: getAccountColor(account, orderedAccounts) }} />
                 <span className="chip-label">{account.label}</span>
                 {creditsLabel && <span className="chip-badge">{creditsLabel}</span>}
                 {active && <span className="chip-badge is-active">{text.active}</span>}
@@ -1766,7 +1826,7 @@ export default function App() {
         </div>
 
         {focus.kind !== "overview" && (
-          <section className="focus-panel surface-card">
+          <section className="focus-panel">
             <div className="focus-header">
               <div className="focus-header-titles">
                 <span className="section-label">{text.usageFocus}</span>

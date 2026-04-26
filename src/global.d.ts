@@ -5,9 +5,10 @@ declare global {
     opencodeCodexAuth: {
       appVersion: string;
       getState: () => Promise<unknown>;
+      onStateChanged: (listener: (state: unknown) => void) => () => void;
       refreshAll: () => Promise<unknown>;
       refreshAccount: (accountId: string) => Promise<unknown>;
-      updateSettings: (patch: { currentMode?: "opencode" | "codex"; opencodeAuthPath?: string; codexAuthPath?: string; pollIntervalMs?: number }) => Promise<unknown>;
+      updateSettings: (patch: { currentMode?: "opencode" | "codex"; opencodeAuthPath?: string; codexAuthPath?: string }) => Promise<unknown>;
       pickAuthPath: () => Promise<unknown>;
       loginImportAccount: () => Promise<unknown>;
       importLiveAccount: () => Promise<unknown>;
