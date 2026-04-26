@@ -322,10 +322,6 @@
 - 含义：OpenCode live auth 路径。
 - 当前作用：导入当前 / 激活账号 / 登录后读取。
 
-### `settings.pollIntervalMs`
-- 含义：自动查询频率。
-- 当前作用：定时刷新额度。
-
 ### `activeAccountId`
 - 含义：当前实际给 OpenCode 使用的账号。
 - 当前作用：
@@ -364,7 +360,6 @@
 - `history[].batchAt`
 - `history[].windows.*.remainingPercent`
 - `settings.opencodeAuthPath`
-- `settings.pollIntervalMs`
 - 浏览器本地 `ocam-locale`
 - 浏览器本地 `ocam-theme`
 

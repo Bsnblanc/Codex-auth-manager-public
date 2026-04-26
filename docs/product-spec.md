@@ -38,7 +38,7 @@ The app must let the user:
 3. When the target file is a direct Codex auth file, writeback is allowed only if the managed account preserves the direct-specific fields required by that file format.
 4. The current mode determines which login/import/export/switch actions are available and which target auth path is shown.
 5. The app exposes only two user-facing auth formats: OpenCode auth and Codex auth.
-6. The app may keep a richer internal auth superset, but that internal shape is not a user-facing import/export format.
+6. The app keeps one managed account record per real account, with a shared OAuth base plus optional Codex-only extras.
 7. The UI is single-page. Hover and focus states determine what details are visible.
 8. Usage statistics only expand when the user focuses an account or the aggregate view.
 
@@ -64,17 +64,20 @@ Rationale:
 
 - `id`
 - `label`
+- `labelIsAuto`
 - `color`
+- `providerKey`
 - `createdAt`
 - `updatedAt`
-- `lastUsedAt`
-- `authFragment`
-- `profilePath`
-- `status`
+- `authBase`
+- `codexExtras`
+- `lastSyncedAt`
 - `planType`
-- `workspaceName`
 - `email`
-- `isActive`
+- `accountId`
+- `jwtMetadata`
+- `lastQuota`
+- `lastError`
 
 ### Live Quota Snapshot
 
@@ -97,16 +100,19 @@ Rationale:
 
 ### App Preferences
 
-- `pollIntervalMs`
 - `theme`
 - `opencodeAuthPath`
-- `compactMode`
 
 ## Auth Management Model
 
 ### Source of Truth
 
-The app stores managed Codex account fragments in its own profile store.
+The app stores one managed account record per real account in its own profile store.
+
+Each record keeps:
+
+- shared OAuth base fields used by OpenCode quota fetch, OpenCode auth export, and account switching
+- optional Codex-only extras required for direct Codex export and direct Codex file writeback
 
 ### Auth Target Rule
 
@@ -127,16 +133,22 @@ The app has two modes:
 The current mode controls:
 
 - which login command is used
-- which JSON import format is accepted
 - which auth path is edited and written
 - which accounts are visible and switchable
 - which export format is produced
 
 ### Acquisition Rule
 
-- `OpenCode` mode accepts OpenCode login/import flows
-- `Codex` mode accepts Codex login/import flows
-- if an imported OpenCode account lacks direct Codex fields, it remains usable only in OpenCode mode
+- login/import-live flows still follow the current mode
+- there is no separate user-facing `replace-from-live` requirement; live auth acquisition is covered by the current mode's import/login paths
+- file import detects actual supported auth format from file content rather than rejecting the other mode's format first
+- if an imported OpenCode account lacks direct Codex fields, it remains usable only in OpenCode mode until Codex extras are acquired
+
+### Deduplication Rule
+
+- same access token updates the existing managed account record
+- same real `accountId` imported through another supported auth form merges into the existing managed account record
+- same-account cross-format imports must not create a second separate record or hard-abort the import
 
 ### OpenCode Sync Rule
 
@@ -144,14 +156,17 @@ When the user switches accounts, the app:
 
 1. reads the current OpenCode live auth file
 2. identifies the Codex/OpenAI auth node
-3. replaces only that node with the selected managed account fragment
+3. replaces only that node with the selected managed account's shared OAuth base
 4. writes the merged result back atomically
 5. preserves every unrelated provider entry exactly as-is
 
 ### Import and Export
 
-- import only Codex/OpenAI auth fragments into the managed store
+- import supported OpenCode auth or direct Codex auth into the managed store
+- detect the actual file format before deciding whether the import is valid
 - export only the current mode's real auth format
+- OpenCode export writes the shared OAuth base only
+- Codex export requires the stored Codex-only extras
 - do not import or export unrelated provider credentials
 - do not expose any separate richer manager format to the user
 
@@ -159,7 +174,12 @@ When the user switches accounts, the app:
 
 ### Live Quota
 
-The app keeps the active account on dynamic refresh and wakes background accounts primarily from their known reset times.
+The app automatically refreshes quota while the app is running.
+
+- active account: dynamic refresh cadence based on remaining quota
+- background accounts in the current mode: primarily wake from known reset times
+- if a background account has no known reset time yet, it still receives a low-frequency fallback refresh
+- no manual polling setting is required in the UI
 
 ### Historical Statistics
 
@@ -169,7 +189,6 @@ The app stores snapshots locally and derives:
 - per-account usage
 - recent trends
 - exhaustion and reset events
-- switch history
 
 ## Interaction Model
 
@@ -178,7 +197,6 @@ The app stores snapshots locally and derives:
 - show three aggregate quota bars only
 - do not show usage charts yet
 - show account color composition inside each current remaining bar
-- show a side panel with aggregate app summary
 
 ## Hover State
 
@@ -186,7 +204,6 @@ When hovering an account segment in any quota bar:
 
 - highlight the same account across all three quota bars
 - dim other accounts
-- update the side panel to the hovered account identity and status
 - do not expand usage charts yet
 
 ## Focus State
@@ -195,7 +212,6 @@ When clicking an account segment:
 
 - lock focus on that account
 - show that account's usage charts for all three quota types
-- keep the side panel on that account
 - morph the top three quota bars into that account's three current quota fills until focus exits
 
 When clicking an aggregate quota bar:
@@ -221,18 +237,17 @@ Each bar uses:
 
 ### Low or Zero Accounts
 
-- very small accounts retain true proportion in the bar
+- very small accounts may use a minimum visible width in the bar for readability
 - tiny hit areas are compensated with larger hover targets and legend chips
 - zero-remaining accounts do not occupy remaining bar area
-- zero or unknown accounts remain visible in the account chip rail and side panel state
+- zero or unknown accounts remain visible in the account chip rail
 
 ## Single-Page Layout
 
 - top: app title, refresh, add/import/export actions
 - center: three quota bars stacked vertically
-- right: side panel for aggregate or focused account identity and actions
 - bottom: focus-only charts area, hidden until aggregate or account focus is selected
-- footer rail: account chips for direct focus, state, and legend mapping
+- footer rail: collapsible account chips for direct focus, state, and legend mapping
 
 ## Core Features for MVP
 

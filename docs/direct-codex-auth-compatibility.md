@@ -93,6 +93,11 @@ Safe rule:
 2. If a managed account only has the OpenCode-style fragment (`access`/`refresh`/`expires`/`accountId`) and lacks `id_token`, do not claim direct Codex writeback is safe.
 3. In that case, require one direct Codex import/login for that account before managing it as a direct Codex target.
 
+## Verified Directionality
+
+- `Codex -> OpenCode`: supported when the direct Codex file contains the expected OAuth tokens; the shared OAuth base can be written back as an OpenCode `openai` auth node.
+- `OpenCode -> Codex`: not generally safe unless the managed account also preserves the direct Codex-only fields, especially `id_token`.
+
 ## Implementation Boundary
 
 This means the app can safely support:
@@ -100,6 +105,21 @@ This means the app can safely support:
 - importing direct Codex auth files into the existing managed account store
 - detecting whether a managed account has enough direct-specific fields for direct Codex writeback
 - refusing direct Codex activation/writeback when the required direct fields are missing
+
+## Final Managed Auth Model
+
+The app now stores one account record per real account:
+
+1. `authBase` — shared OAuth fields used by OpenCode auth export, live quota fetch, and OpenCode auth switching
+2. `codexExtras` — optional direct Codex-only fields required for Codex export/writeback
+
+This internal model is not a third user-facing import/export format.
+
+## Merge Rule
+
+- same access token updates the existing record
+- same `accountId` imported through a different supported auth form merges into that existing record
+- same-account cross-format imports must not hard-abort and must not create a duplicate managed record
 
 ## Public Format Decision
 
