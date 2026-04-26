@@ -2,4 +2,10 @@ node_modules/
 dist/
 dist-electron/
 .sisyphus/
-{
+release/
+%TEMP%/
+.claude/
+.research/
+opencode-command-*.txt
+opencode-serve-*.log
+sub2api-account-*.json
