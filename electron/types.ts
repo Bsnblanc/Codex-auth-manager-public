@@ -7,11 +7,28 @@ export type AuthProviderEntry = {
   access?: string;
   refresh?: string;
   expires?: number;
+  accountId?: string;
   enterpriseUrl?: string;
   [key: string]: unknown;
 };
 
 export type AuthFileRecord = Record<string, AuthProviderEntry | unknown>;
+
+export type AuthBase = {
+  type: "oauth";
+  access: string;
+  refresh: string;
+  expires?: number;
+  accountId?: string;
+  enterpriseUrl?: string;
+};
+
+export type CodexAuthExtras = {
+  idToken: string;
+  authMode?: string;
+  lastRefresh?: string;
+  openaiApiKey?: string | null;
+};
 
 export type JwtMetadata = {
   audience: string[];
@@ -74,7 +91,8 @@ export type ManagedAccount = {
   labelIsAuto: boolean;
   color: string;
   providerKey: ProviderKey;
-  authFragment: AuthProviderEntry;
+  authBase: AuthBase;
+  codexExtras: CodexAuthExtras | null;
   createdAt: string;
   updatedAt: string;
   lastSyncedAt: string | null;
@@ -90,7 +108,6 @@ export type AppSettings = {
   currentMode: AuthMode;
   opencodeAuthPath: string;
   codexAuthPath: string;
-  pollIntervalMs: number;
 };
 
 export type AppStore = {
@@ -116,6 +133,7 @@ export type ImportResult = {
   importedAccountIds: string[];
   state: DashboardState;
   notices: string[];
+  quarantinedStorePath?: string;
 };
 
 export type ExportResult = {
