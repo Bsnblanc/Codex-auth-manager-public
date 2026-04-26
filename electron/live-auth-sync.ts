@@ -5,7 +5,7 @@ export function findManagedAccountByAccess(accounts: ManagedAccount[], accessTok
     return null;
   }
 
-  return accounts.find((account) => account.authFragment.access === accessToken) ?? null;
+  return accounts.find((account) => account.authBase.access === accessToken) ?? null;
 }
 
 export function classifyLiveAuthSync(accounts: ManagedAccount[], activeAccountId: string | null, accessToken: string | null | undefined) {

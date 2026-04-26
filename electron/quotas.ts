@@ -1,5 +1,5 @@
 import { getAccountIdFromJwt, getEmailFromJwt, getJwtMetadata } from "./jwt.js";
-import type { AuthProviderEntry, CreditsSnapshot, ManagedAccount, QuotaSnapshot, QuotaWindowSnapshot } from "./types.js";
+import type { AuthBase, CreditsSnapshot, ManagedAccount, QuotaSnapshot, QuotaWindowSnapshot } from "./types.js";
 
 const DEFAULT_BASE_URL = "https://chatgpt.com/backend-api";
 const FETCH_TIMEOUT_MS = 20000;
@@ -88,17 +88,17 @@ function buildUsageUrl(baseUrl?: string) {
   return trimmed.includes("/backend-api") ? `${trimmed}/wham/usage` : `${trimmed}/api/codex/usage`;
 }
 
-export function canPollAccount(fragment: AuthProviderEntry): boolean {
-  return fragment.type === "oauth" && typeof fragment.access === "string" && fragment.access.length > 0;
+export function canPollAccount(authBase: AuthBase): boolean {
+  return authBase.type === "oauth" && authBase.access.length > 0;
 }
 
 export async function fetchQuotaSnapshot(account: ManagedAccount, fetchedAt: string): Promise<QuotaSnapshot> {
-  const { authFragment } = account;
-  if (!canPollAccount(authFragment)) {
+  const { authBase } = account;
+  if (!canPollAccount(authBase)) {
     throw new Error("Managed account is missing OAuth access credentials.");
   }
 
-  const accessToken = authFragment.access as string;
+  const accessToken = authBase.access;
   const jwtMetadata = getJwtMetadata(accessToken);
 
   const headers: Record<string, string> = {
@@ -116,7 +116,7 @@ export async function fetchQuotaSnapshot(account: ManagedAccount, fetchedAt: str
 
   let response: Response;
   try {
-    response = await fetch(buildUsageUrl(authFragment.enterpriseUrl), { headers, signal: controller.signal });
+    response = await fetch(buildUsageUrl(authBase.enterpriseUrl), { headers, signal: controller.signal });
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
       throw new Error(`Quota request timed out after ${FETCH_TIMEOUT_MS}ms`);
